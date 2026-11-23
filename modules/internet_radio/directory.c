@@ -10,6 +10,7 @@
 
 typedef struct {
     unsigned serial, offset;
+    radio_directory_mode_t mode;
     char query[RADIO_QUERY_BYTES];
 } directory_request_t;
 
@@ -25,10 +26,15 @@ static directory_response_t response, incoming;
 static atomic_uint requested;
 static char body[RESPONSE_BYTES + 1];
 
-void radio_directory_request(gadget_module_context_t *module, const char *query, unsigned offset)
+void radio_directory_request(gadget_module_context_t *module, const char *query, radio_directory_mode_t mode,
+                             unsigned offset)
 {
-    directory_request_t next = {.serial = request.serial + 1, .offset = offset < PAGE_LIMIT ? offset : PAGE_LIMIT};
-    memcpy(next.query, query, radio_text_length(query, sizeof(next.query) - 1));
+    directory_request_t next = {
+        .serial = request.serial + 1, .offset = offset < PAGE_LIMIT ? offset : PAGE_LIMIT, .mode = mode,
+    };
+    if (query != NULL) {
+        memcpy(next.query, query, radio_text_length(query, sizeof(next.query) - 1));
+    }
     module->host->copy_shared(module, &request, &next, sizeof(next));
     atomic_store(&requested, next.serial);
     module->host->wake_worker(module);
@@ -67,15 +73,32 @@ static void encode_query(const char *query, char *out)
     *out = '\0';
 }
 
+static bool ascii_letter(char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+}
+
 static gadget_json_t *fetch_page(gadget_module_context_t *module, const char *host,
                                  const directory_request_t *job)
 {
     char encoded[3 * RADIO_QUERY_BYTES];
     char url[384];
     encode_query(job->query, encoded);
+    const char *field = "name";
+    if (job->mode == DIRECTORY_COUNTRY) {
+        field = "country";
+        if (ascii_letter(job->query[0]) && ascii_letter(job->query[1]) && job->query[2] == '\0') {
+            field = "countrycode";
+            for (unsigned i = 0; i < 2; ++i) {
+                if (encoded[i] >= 'a' && encoded[i] <= 'z') {
+                    encoded[i] -= 'a' - 'A';
+                }
+            }
+        }
+    }
     module->host->format(url, sizeof(url),
-                         "https://%s/json/stations/search?name=%s&codec=MP3&hidebroken=true&order=name&limit=%u&offset=%u",
-                         host, encoded, RADIO_PAGE_ROWS, job->offset);
+                         "https://%s/json/stations/search?%s=%s&codec=MP3&hidebroken=true&order=name&limit=%u&offset=%u",
+                         host, field, encoded, RADIO_PAGE_ROWS, job->offset);
     int status = 0;
     gadget_http_stream_t *stream = module->host->http_open(module, url, &status);
     if (stream == NULL) {
@@ -88,6 +111,9 @@ static gadget_json_t *fetch_page(gadget_module_context_t *module, const char *ho
            module->host->uptime_ms() < deadline) {
         const size_t free = sizeof(body) - used;
         count = module->host->http_read(module, stream, body + used, free < 1024 ? free : 1024);
+        if (count == GADGET_HTTP_AGAIN) {
+            continue;
+        }
         if (count <= 0) {
             break;
         }
@@ -107,13 +133,19 @@ static gadget_json_t *fetch_page(gadget_module_context_t *module, const char *ho
 
 static void copy_station_name(char out[RADIO_NAME_BYTES], const char *name)
 {
+    while (*name != '\0' && (unsigned char)*name <= ' ') {
+        ++name;
+    }
     size_t size = radio_text_length(name, RADIO_NAME_BYTES - 1);
     while (size != 0 && ((unsigned char)name[size] & 0xc0) == 0x80) {
         --size;
     }
     for (size_t i = 0; i < size; ++i) {
-        const char ch = name[i];
-        out[i] = (unsigned char)ch < 32 ? ' ' : ch;
+        const unsigned char ch = (unsigned char)name[i];
+        out[i] = ch < 32 || ch == 127 ? ' ' : (char)ch;
+    }
+    while (size != 0 && out[size - 1] == ' ') {
+        --size;
     }
     out[size] = '\0';
 }
@@ -129,6 +161,10 @@ static void parse_stations(const gadget_json_api_t *json, const gadget_json_t *d
         const char *name = json->string(json->member(item, "name"));
         const char *codec = json->string(json->member(item, "codec"));
         const char *url = json->string(json->member(item, "url_resolved"));
+        float hls;
+        if (json->number(json->member(item, "hls"), &hls) && hls != 0) {
+            continue;
+        }
         if (!radio_http_url(url)) {
             url = json->string(json->member(item, "url"));
         }
@@ -136,8 +172,12 @@ static void parse_stations(const gadget_json_api_t *json, const gadget_json_t *d
             memcmp(codec, "MP3", 3) != 0 || !radio_http_url(url)) {
             continue;
         }
-        radio_station_t *row = &page->rows[page->count++];
+        radio_station_t *row = &page->rows[page->count];
         copy_station_name(row->name, name);
+        if (row->name[0] == '\0') {
+            continue;
+        }
+        ++page->count;
         memcpy(row->url, url, radio_text_length(url, sizeof(row->url) - 1) + 1);
         const char *uuid = json->string(json->member(item, "stationuuid"));
         if (radio_uuid_valid(uuid)) {
@@ -174,6 +214,9 @@ void radio_directory_worker(gadget_module_context_t *module)
             continue;
         }
         handled = serial;
+        if (job.query[0] == '\0') {
+            continue;
+        }
         incoming = (directory_response_t){.serial = serial,
                                          .page = {.offset = job.offset, .status = DIRECTORY_ERROR}};
         const uint64_t now = module->host->uptime_ms();

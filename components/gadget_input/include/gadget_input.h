@@ -15,6 +15,7 @@ typedef enum {
     GADGET_INPUT_AUDIO_JACK,
     GADGET_INPUT_KEY,
     GADGET_INPUT_EXIT,
+    GADGET_INPUT_TOGGLE_DISPLAY,
 } gadget_input_action_t;
 
 typedef struct {
@@ -22,6 +23,7 @@ typedef struct {
     unsigned face;  // Zero-based F-key index for GADGET_INPUT_SELECT_FACE.
     int32_t value;
     gadget_key_t key;
+    int64_t received_at_us;
 } gadget_input_event_t;
 
 esp_err_t gadget_input_init(void (*sink)(const gadget_input_event_t *));

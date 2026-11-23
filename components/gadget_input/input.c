@@ -56,16 +56,21 @@ static bool decode(const bsp_input_event_t *event, bool hyper_latched, gadget_in
         return false;
     }
     const bsp_input_navigation_key_t key = event->args_navigation.key;
-    if ((hyper_latched || (event->args_navigation.modifiers & BSP_INPUT_MODIFIER_SUPER)) &&
-        key >= BSP_INPUT_NAVIGATION_KEY_F1 && key <= BSP_INPUT_NAVIGATION_KEY_F6) {
-        out->action = GADGET_INPUT_SELECT_FACE;
-        out->face = key - BSP_INPUT_NAVIGATION_KEY_F1;
-        return true;
-    }
     out->action = GADGET_INPUT_KEY;
     out->key.modifiers = modifiers(event->args_navigation.modifiers);
+    if (key >= BSP_INPUT_NAVIGATION_KEY_F1 && key <= BSP_INPUT_NAVIGATION_KEY_F6) {
+        const unsigned index = key - BSP_INPUT_NAVIGATION_KEY_F1;
+        if (hyper_latched || (out->key.modifiers & GADGET_MOD_HYPER)) {
+            out->action = GADGET_INPUT_SELECT_FACE;
+            out->face = index;
+        } else {
+            out->key.kind = GADGET_KEY_F1 + index;
+        }
+        return true;
+    }
     switch (key) {
     case BSP_INPUT_NAVIGATION_KEY_RETURN: out->key.kind = GADGET_KEY_ENTER; break;
+    case BSP_INPUT_NAVIGATION_KEY_TAB: out->key.kind = GADGET_KEY_TAB; break;
     case BSP_INPUT_NAVIGATION_KEY_LEFT: out->key.kind = GADGET_KEY_LEFT; break;
     case BSP_INPUT_NAVIGATION_KEY_RIGHT: out->key.kind = GADGET_KEY_RIGHT; break;
     case BSP_INPUT_NAVIGATION_KEY_UP: out->key.kind = GADGET_KEY_UP; break;
@@ -93,6 +98,7 @@ static void intake(void *argument)
     uint64_t exit_at = 0;
     int64_t hyper_until = 0;
     bool esc_held = false;
+    bool power_held = false;
     bool headphones = false;
     bool have_route = bsp_input_read_action(BSP_INPUT_ACTION_TYPE_AUDIO_JACK, &headphones) == ESP_OK;
     if (have_route) {
@@ -126,6 +132,15 @@ static void intake(void *argument)
             if (event.type == INPUT_EVENT_TYPE_ACTION && event.args_action.type == BSP_INPUT_ACTION_TYPE_AUDIO_JACK) {
                 have_route = true;
                 send_value(GADGET_INPUT_AUDIO_JACK, event.args_action.state);
+            } else if (event.type == INPUT_EVENT_TYPE_ACTION &&
+                       event.args_action.type == BSP_INPUT_ACTION_TYPE_POWER_BUTTON) {
+                const bool pressed = event.args_action.state;
+                if (pressed && !power_held) {
+                    hyper_until = 0;
+                    exit_at = 0;
+                    send_value(GADGET_INPUT_TOGGLE_DISPLAY, 0);
+                }
+                power_held = pressed;
             } else if (event.type == INPUT_EVENT_TYPE_NAVIGATION &&
                        event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_ESC) {
                 if (event.args_navigation.state && !esc_held) {
@@ -148,7 +163,7 @@ static void intake(void *argument)
                     send_value(GADGET_INPUT_VOLUME_STEP, volume_delta[index]);
                 }
             } else {
-                gadget_input_event_t input = {0};
+                gadget_input_event_t input = {.received_at_us = now_us};
                 if (decode(&event, hyper_latched, &input)) {
                     exit_at = 0;
                     send_input(&input);

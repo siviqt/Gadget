@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Civil date arithmetic adapted from Chronos, copyright (c) 2026 Chronos project.
 #include "gadget_module.h"
+#include "gadget_keycap.h"
+
+#define CLOCK_TIME_ZONE_KEY GADGET_KEY_F1
 
 static const char *const months[] = {
     "January", "February", "March", "April", "May", "June",
@@ -93,6 +96,8 @@ static void input(gadget_module_context_t *module, const gadget_key_t *key)
         if (key->text[0] != 'u' && key->text[0] != 'U') {
             return;
         }
+        /* Fall through. */
+    case CLOCK_TIME_ZONE_KEY:
         show_utc = !show_utc;
         if (!module->host->state_set_int(module, "show_utc", show_utc)) {
             module->host->log(module, "Unable to queue clock settings");
@@ -169,8 +174,10 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
                          (unsigned)current.day, months[current.month - 1], (unsigned)current.year);
     canvas->text(canvas->handle, margin, top + 113, 20, muted, line);
     render_calendar(module, canvas);
-    canvas->text(canvas->handle, margin, canvas->height - 44, 16, muted,
-                 "Left/Right  Month     Enter  Today     U  Local/UTC");
+    const int footer = canvas->height - 44;
+    gadget_draw_function_key(canvas, margin, footer, CLOCK_TIME_ZONE_KEY, 0xff263b4a, accent);
+    canvas->text(canvas->handle, margin + GADGET_KEYCAP_WIDTH + 8, footer + 2, 16, muted, "Local/UTC");
+    canvas->text(canvas->handle, margin + 130, footer + 2, 16, muted, "Left/Right  Month     Enter  Today");
 }
 
 static const gadget_module_t hooks = {

@@ -7,6 +7,7 @@
 #define RADIO_UUID_BYTES 37
 #define RADIO_PAGE_ROWS 4
 #define RADIO_QUERY_BYTES 56
+#define RADIO_TITLE_BYTES 160
 #define DIRECTORY_MIRRORS 3
 #define DIRECTORY_HOST_BYTES 64
 
@@ -18,7 +19,9 @@ typedef struct {
     uint16_t bitrate;
 } radio_station_t;
 
-typedef enum { RADIO_SAVED, RADIO_DUPLICATE, RADIO_SAVE_FAILED } radio_save_t;
+typedef enum {
+    RADIO_SAVE_PENDING, RADIO_SAVE_QUEUED, RADIO_DUPLICATE, RADIO_SAVE_FAILED,
+} radio_save_t;
 
 typedef enum {
     RADIO_STOPPED, RADIO_CONNECTING, RADIO_BUFFERING, RADIO_PLAYING,
@@ -28,6 +31,8 @@ typedef enum {
 typedef enum {
     DIRECTORY_IDLE, DIRECTORY_LOADING, DIRECTORY_RESULTS, DIRECTORY_OFFLINE, DIRECTORY_ERROR,
 } directory_status_t;
+
+typedef enum { DIRECTORY_NAME, DIRECTORY_COUNTRY } radio_directory_mode_t;
 
 typedef struct {
     unsigned offset;
@@ -42,16 +47,25 @@ void radio_decode_worker(gadget_module_context_t *module);
 void radio_directory_worker(gadget_module_context_t *module);
 
 void radio_tune(gadget_module_context_t *module, const char *url);
-void radio_set_levels(unsigned speaker, unsigned headphones);
+void radio_set_levels(unsigned speaker, unsigned headphones, bool muted);
 radio_playback_t radio_playback(void);
-void radio_directory_request(gadget_module_context_t *module, const char *query, unsigned offset);
+void radio_stream_title(gadget_module_context_t *module, char out[RADIO_TITLE_BYTES]);
+void radio_directory_request(gadget_module_context_t *module, const char *query, radio_directory_mode_t mode,
+                             unsigned offset);
 void radio_directory_page(gadget_module_context_t *module, radio_directory_page_t *page);
 unsigned radio_find_directory_hosts(gadget_module_context_t *module,
                                     char hosts[DIRECTORY_MIRRORS][DIRECTORY_HOST_BYTES]);
 void radio_load_stations(gadget_module_context_t *module);
 unsigned radio_saved_count(void);
 const radio_station_t *radio_saved_station(unsigned index);
+bool radio_same_url(const radio_station_t *a, const radio_station_t *b);
+bool radio_same_station(const radio_station_t *a, const radio_station_t *b);
+bool radio_station_name_valid(const char *name);
+bool radio_station_url_valid(const char *url);
+bool radio_preset_hidden(const char *url);
 radio_save_t radio_save_station(gadget_module_context_t *module, const radio_station_t *station);
+radio_save_t radio_remove_station(gadget_module_context_t *module, const radio_station_t *station, bool preset);
+gadget_state_write_status_t radio_catalog_write_status(gadget_module_context_t *module);
 bool radio_uuid_valid(const char *uuid);
 
 static inline size_t radio_text_length(const char *text, size_t limit)

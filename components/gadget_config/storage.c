@@ -28,6 +28,7 @@ typedef struct {
     void *contents;
     size_t size;
     int64_t due;
+    atomic_uint *result;
 } save_job_t;
 
 static const char *const TAG = "gadget_config";
@@ -132,10 +133,14 @@ static void save_worker(void *unused)
         const bool finished = stopping && next_due == INT64_MAX;
         taskEXIT_CRITICAL(&lock);
         if (job.contents != NULL) {
-            if (!write_file(&job)) {
+            const bool saved = write_file(&job);
+            if (!saved) {
                 ESP_LOGW(TAG, "Could not save %s/%s", job.id, job.filename);
             }
             free(job.contents);
+            if (job.result != NULL) {
+                atomic_store(job.result, saved ? GADGET_STATE_WRITE_SAVED : GADGET_STATE_WRITE_FAILED);
+            }
         } else if (finished) {
             break;
         } else {
@@ -205,13 +210,15 @@ int gadget_config_read(const char *id, const char *filename, gadget_state_copy_t
     return (int)count;
 }
 
-bool gadget_config_write(const char *id, const char *filename, const void *contents, size_t size)
+static bool queue_write(const char *id, const char *filename, const void *contents, size_t size, atomic_uint *result)
 {
     if (worker == NULL || !safe_name(id, GADGET_MODULE_ID_SIZE) || !safe_filename(filename) ||
         contents == NULL || size > GADGET_STATE_FILE_LIMIT) {
         return false;
     }
-    save_job_t job = {.size = size, .due = esp_timer_get_time() + SAVE_DELAY_US};
+    save_job_t job = {
+        .size = size, .due = esp_timer_get_time() + (result == NULL ? SAVE_DELAY_US : 0), .result = result,
+    };
     strcpy(job.id, id);
     strcpy(job.filename, filename);
     job.contents = heap_caps_malloc(size != 0 ? size : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -223,10 +230,11 @@ bool gadget_config_write(const char *id, const char *filename, const void *conte
     int slot = -1;
     void *replaced = NULL;
     taskENTER_CRITICAL(&lock);
-    if (!stopping) {
+    if (!stopping && (result == NULL || atomic_load(result) != GADGET_STATE_WRITE_PENDING)) {
         for (unsigned i = 0; i < JOB_LIMIT; ++i) {
             if (jobs[i].contents != NULL && strcmp(id, jobs[i].id) == 0 && strcmp(filename, jobs[i].filename) == 0) {
-                slot = (int)i;
+                // Preserve the ordering and the completion result of an explicit write.
+                slot = result == NULL && jobs[i].result == NULL ? (int)i : -1;
                 break;
             }
             if (slot < 0 && jobs[i].contents == NULL) {
@@ -236,6 +244,9 @@ bool gadget_config_write(const char *id, const char *filename, const void *conte
         if (slot >= 0) {
             replaced = jobs[slot].contents;
             jobs[slot] = job;
+            if (result != NULL) {
+                atomic_store(result, GADGET_STATE_WRITE_PENDING);
+            }
         }
     }
     taskEXIT_CRITICAL(&lock);
@@ -246,4 +257,15 @@ bool gadget_config_write(const char *id, const char *filename, const void *conte
     }
     xTaskNotifyGive(worker);
     return true;
+}
+
+bool gadget_config_write(const char *id, const char *filename, const void *contents, size_t size)
+{
+    return queue_write(id, filename, contents, size, NULL);
+}
+
+bool gadget_config_write_checked(const char *id, const char *filename, const void *contents, size_t size,
+                                 atomic_uint *result)
+{
+    return result != NULL && queue_write(id, filename, contents, size, result);
 }

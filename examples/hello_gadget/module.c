@@ -1,5 +1,8 @@
 #include "gadget_module.h"
+#include "gadget_keycap.h"
 #include "../pulse_event.h"
+
+#define HELLO_INCREMENT_KEY GADGET_KEY_F1
 
 static uint32_t presses;
 static uint32_t ticks;
@@ -24,9 +27,9 @@ static void deactivate(gadget_module_context_t *module)
 
 static void input(gadget_module_context_t *module, const gadget_key_t *key)
 {
-    if (key->kind == GADGET_KEY_ENTER) {
+    if (key->kind == HELLO_INCREMENT_KEY || key->kind == GADGET_KEY_ENTER) {
         ++presses;
-        module->host->log(module, "Enter handled by the SD face");
+        module->host->log(module, "Counter incremented by the SD face");
         module->host->invalidate(module);
     }
 }
@@ -68,10 +71,12 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
     char digits[11];
     canvas->text(canvas->handle, margin, 28, 40, white, "Hello Gadget");
     canvas->rect(canvas->handle, margin, 84, canvas->width - 2 * margin, 1, 0xff3c5368);
-    canvas->text(canvas->handle, margin, 100, 20, muted, "Enter presses");
+    canvas->text(canvas->handle, margin, 100, 20, muted, "Counter");
     canvas->text(canvas->handle, right, 100, 20, muted, "Background service ticks");
     canvas->text(canvas->handle, margin, 128, 42, accent, decimal(presses, digits));
     canvas->text(canvas->handle, right, 128, 42, accent, decimal(ticks, digits));
+    gadget_draw_function_key(canvas, margin, 183, HELLO_INCREMENT_KEY, 0xff263b4a, accent);
+    canvas->text(canvas->handle, margin + GADGET_KEYCAP_WIDTH + 8, 185, 16, muted, "Increment");
     if (ticks == 0) {
         canvas->text(canvas->handle, right, 184, 16, muted, "Waiting for Pulse service");
     }

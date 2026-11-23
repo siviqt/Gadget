@@ -24,6 +24,13 @@ typedef enum {
     GADGET_KEY_DOWN,
     GADGET_KEY_BACKSPACE,
     GADGET_KEY_TEXT,
+    GADGET_KEY_TAB,
+    GADGET_KEY_F1,
+    GADGET_KEY_F2,
+    GADGET_KEY_F3,
+    GADGET_KEY_F4,
+    GADGET_KEY_F5,
+    GADGET_KEY_F6,
 } gadget_key_kind_t;
 
 enum {
@@ -85,6 +92,13 @@ typedef enum {
     GADGET_STATE_BACKUP,
 } gadget_state_copy_t;
 
+typedef enum {
+    GADGET_STATE_WRITE_IDLE,
+    GADGET_STATE_WRITE_PENDING,
+    GADGET_STATE_WRITE_SAVED,
+    GADGET_STATE_WRITE_FAILED,
+} gadget_state_write_status_t;
+
 typedef struct {
     uint64_t sampled_at_ms;
     float gyro[3];   // Degrees per second.
@@ -122,6 +136,13 @@ typedef struct {
     uint8_t wifi, pcm;
     uint8_t modules, services;
 } gadget_system_status_t;
+
+typedef struct {
+    uint8_t percent;
+    bool present;
+    bool charging;
+    bool external_power;
+} gadget_battery_status_t;
 
 typedef struct {
     char name[40];
@@ -202,6 +223,13 @@ typedef struct {
     // Read the periodic runtime snapshot and enumerate loaded services on the runtime task.
     bool (*system_status)(gadget_module_context_t *, gadget_system_status_t *);
     bool (*system_service)(gadget_module_context_t *, unsigned index, gadget_service_status_t *);
+    // Runtime task only. A module may have one checked write pending at a time.
+    bool (*state_write_file_checked)(gadget_module_context_t *, const char *filename, const void *contents, size_t size);
+    gadget_state_write_status_t (*state_write_status)(gadget_module_context_t *);
+    // Network worker only. Requests ICY metadata. Zero interval indicates unframed audio.
+    gadget_http_stream_t *(*http_open_icy)(gadget_module_context_t *, const char *url, int *status, uint32_t *interval);
+    // Runtime task only. Returns false until a valid battery sample is available.
+    bool (*battery_status)(gadget_module_context_t *, gadget_battery_status_t *);
 } gadget_host_t;
 
 #define GADGET_HOST_HAS(host, member) \

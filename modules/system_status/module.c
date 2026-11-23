@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "gadget_module.h"
+#include "gadget_keycap.h"
 
 #define SERVICES_PER_PAGE 4
+#define SYSTEM_PREV_PAGE_KEY GADGET_KEY_F1
+#define SYSTEM_NEXT_PAGE_KEY GADGET_KEY_F2
 
 static const uint32_t background = 0xff111923;
 static const uint32_t foreground = 0xfff0f5f8;
@@ -9,6 +12,8 @@ static const uint32_t muted = 0xffa8b9c7;
 static const uint32_t accent = 0xff6ed9ed;
 static const uint32_t rule = 0xff324657;
 static gadget_system_status_t status;
+static gadget_battery_status_t battery;
+static bool battery_valid;
 static unsigned service_page;
 
 static bool init(gadget_module_context_t *module)
@@ -19,6 +24,7 @@ static bool init(gadget_module_context_t *module)
 static void activate(gadget_module_context_t *module)
 {
     module->host->system_status(module, &status);
+    battery_valid = GADGET_HOST_HAS(module->host, battery_status) && module->host->battery_status(module, &battery);
 }
 
 static void update(gadget_module_context_t *module, uint64_t now_ms)
@@ -120,10 +126,38 @@ static void draw_services(gadget_module_context_t *module, const gadget_canvas_t
         metric(canvas, x, y + 128 + (int)row * 48, service.name, line);
     }
     if (status.services > SERVICES_PER_PAGE) {
-        host->format(line, sizeof(line), "Left/Right  Services %u/%u", service_page + 1,
+        host->format(line, sizeof(line), "Page %u/%u", service_page + 1,
                      ((unsigned)status.services + SERVICES_PER_PAGE - 1) / SERVICES_PER_PAGE);
-        canvas->text(canvas->handle, x, y + 326, 16, accent, line);
+        const int footer = y + 322;
+        gadget_draw_function_key(canvas, x, footer, SYSTEM_PREV_PAGE_KEY, rule, accent);
+        canvas->text(canvas->handle, x + GADGET_KEYCAP_WIDTH + 7, footer + 2, 16, foreground, "Prev");
+        gadget_draw_function_key(canvas, x + 78, footer, SYSTEM_NEXT_PAGE_KEY, rule, accent);
+        canvas->text(canvas->handle, x + 78 + GADGET_KEYCAP_WIDTH + 7, footer + 2, 16, foreground, "Next");
+        canvas->text(canvas->handle, x + 160, footer + 2, 16, muted, line);
     }
+}
+
+static void draw_battery(const gadget_host_t *host, const gadget_canvas_t *canvas, int x, int y)
+{
+    const bool present = battery_valid && battery.present;
+    const uint32_t outline = present ? foreground : muted;
+    canvas->rect(canvas->handle, x, y, 24, 14, outline);
+    canvas->rect(canvas->handle, x + 1, y + 1, 22, 12, background);
+    canvas->rect(canvas->handle, x + 24, y + 4, 3, 6, outline);
+    const char *label = "Battery unavailable";
+    char percentage[32];
+    if (present) {
+        const int fill = battery.percent * 20 / 100;
+        if (fill > 0) {
+            canvas->rect(canvas->handle, x + 2, y + 2, fill, 10, accent);
+        }
+        host->format(percentage, sizeof(percentage), "%u%%%s", (unsigned)battery.percent,
+                     battery.charging ? "  Charging" : "");
+        label = percentage;
+    } else if (battery_valid) {
+        label = battery.external_power ? "USB only" : "No battery";
+    }
+    canvas->text(canvas->handle, x + 34, y - 3, 16, outline, label);
 }
 
 static void render(gadget_module_context_t *module, const gadget_canvas_t *canvas)
@@ -132,6 +166,7 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
     const bool wide = canvas->width >= 680;
     canvas->rect(canvas->handle, 0, 0, canvas->width, canvas->height, background);
     canvas->text(canvas->handle, margin, 27, 24, foreground, "System status");
+    draw_battery(module->host, canvas, canvas->width - margin - 168, 33);
     canvas->rect(canvas->handle, margin, 72, canvas->width - 2 * margin, 1, rule);
     if (wide) {
         canvas->rect(canvas->handle, canvas->width / 2, top, 1, 338, rule);
@@ -143,8 +178,10 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
 static void input(gadget_module_context_t *module, const gadget_key_t *key)
 {
     const unsigned pages = ((unsigned)status.services + SERVICES_PER_PAGE - 1) / SERVICES_PER_PAGE;
-    if (pages > 1 && (key->kind == GADGET_KEY_LEFT || key->kind == GADGET_KEY_RIGHT)) {
-        service_page = (service_page + (key->kind == GADGET_KEY_RIGHT ? 1 : pages - 1)) % pages;
+    const bool previous = key->kind == SYSTEM_PREV_PAGE_KEY || key->kind == GADGET_KEY_LEFT;
+    const bool next = key->kind == SYSTEM_NEXT_PAGE_KEY || key->kind == GADGET_KEY_RIGHT;
+    if (pages > 1 && (previous || next)) {
+        service_page = (service_page + (next ? 1 : pages - 1)) % pages;
         module->host->invalidate(module);
     }
 }

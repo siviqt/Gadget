@@ -7,7 +7,7 @@
 | M2 · Module SDK and service manager | M1 | Implemented. SD module load, focus, background service and worker shutdown verified. [Validation record](DEVELOPMENT.md#module-sdk-validation) |
 | M3 · Four native reference modules | M2 | Complete on Gadget 0.3.2. Gadget 0.3.3 adds the reel, one-handed switching and workspace guide. [Revision 6 validation](DEVELOPMENT.md#workspace-reel-and-guide-checks) |
 | M4 · Configuration and hardware validation | M3 | Implemented in 0.4.0. SD installation and the stable Wi-Fi baseline passed. Handheld recovery, concurrency and power checks are open. [Hardware validation](DEVELOPMENT.md#m4-hardware-validation) |
-| M5 · Developer SDK and first release | M4 | Implemented in 0.5.0, SD revision 8. Clean build, package validation and SDK loader checks passed on the host. Tanmatsu release checks are pending. |
+| M5 · Developer SDK and first release | M4 | Complete in Gadget 0.5.0, SD revision 8. [Release validation](DEVELOPMENT.md#m5-release-validation) |
 
 ## M0 · Workspace and AppFS starter
 
@@ -63,3 +63,11 @@ Gadget 0.4.0 adds the workspace layout editor to the guide and ships the System 
 - **Acceptance** — Third-party face and service packages build against the documented SDK and load from SD. A clean checkout produces an SD-only package with the AppFS core image, metadata and modules, and passes the device release checks. Document launch, update and return-to-launcher behavior.
 
 [SDK quick start](MODULE_SDK.md#build-and-install) · [Release checks](DEVELOPMENT.md#m5-release-validation)
+
+## Internet Radio 0.4.1
+
+Gadget 0.5.1, SD revision 9, ships the updated player with ICY titles, Radio Browser search by name or country, and SD-backed station management. The user confirmed the radio test build passed on Tanmatsu. [Controls and validation](DEVELOPMENT.md#internet-radio)
+
+## Gadget 0.6.0
+
+SD revision 10 adds the Space startup prompt, screen and keyboard backlight control, battery status and function-key action labels. The user confirmed the release passed their Tanmatsu checks. [Validation record](DEVELOPMENT.md#gadget-060-validation)

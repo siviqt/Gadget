@@ -21,7 +21,7 @@ ESP-IDF generates `build/`, `sdkconfig` and `managed_components/`. The wrapper k
 python3 -B tools/package_sd.py --build-dir build/verify
 ```
 
-| Build component | Gadget 0.5.0 |
+| Build component | Gadget 0.6.0 |
 |---|---|
 | ESP-IDF and FreeRTOS | ESP-IDF 6.0.2 and its bundled FreeRTOS |
 | RISC-V toolchain | Espressif GCC 15.2.0, `esp-15.2.0_20251204` |
@@ -94,16 +94,16 @@ Radio and Weather use saved launcher Wi-Fi profiles. Clock uses the launcher RTC
 
 | Default workspace shortcut | Controls and device check |
 |---|---|
-| `Hyper` + `F1` · Clock | Confirm the RTC time and today's highlight. Check that the box is centered over the date and fits within its row. Use Left/Right to browse months, Enter to return to today and U to toggle local time and UTC. |
-| `Hyper` + `F2` · Radio | Use Left/Right to select a station and Enter to play or stop. The physical volume buttons work from all workspaces. To search during playback, press S, type a name such as Jazz and press Enter. Use Left/Right for pages and Up/Down to select a result. Press A to save the highlighted or tuned station, Enter to tune a result, and Backspace to return to the player. |
+| `Hyper` + `F1` · Clock | Confirm the RTC time and today's highlight. Check that the box is centered over the date and fits within its row. Use Left/Right to browse months, `Enter` to return to today and `F1` to toggle local time and UTC. |
+| `Hyper` + `F2` · Radio | Browse and play a station, search while it plays, and add and remove stations. Relaunch to verify the station list and volume settings. [Radio controls and validation](#internet-radio) |
 | `Hyper` + `F3` · Eyes | Hold Tanmatsu still briefly, then tilt or turn it to check gaze, expressions and blinks. Check that the eyes fit the full face and resume animating after switching away and back. |
-| `Hyper` + `F4` · Weather | Confirm the missing-location screen. Press L, type a city such as Sofia and press Enter. Check current conditions and three forecast days. While Radio is playing and another workspace is focused, press `Hyper` + `R`. Return to Weather and confirm the update time advanced and Radio continued playing. Drop Wi-Fi, request a refresh and confirm that Weather shows the previous forecast while offline and refreshes on reconnect. |
-| `Hyper` + `F5` · Hello Gadget | Press Enter to increment the local count. Switch away and return. The Enter count is retained across focus changes, and the Pulse Service count advances in the background. |
-| `Hyper` + `F6` · System | Wait for the CPU sample and check heap, stack, reel timing, Wi-Fi, PCM audio and service status. Use Left/Right to page through the service list when it exceeds four entries. |
+| `Hyper` + `F4` · Weather | Confirm the missing-location screen. Press `F1`, type a city such as Sofia and press `Enter`. Check current conditions and three forecast days. Press `F2` to refresh. While Radio is playing and another workspace is focused, press `Hyper` + `R`. Return to Weather and confirm the update time advanced and Radio continued playing. Drop Wi-Fi, request a refresh and confirm that Weather shows the previous forecast while offline and refreshes on reconnect. |
+| `Hyper` + `F5` · Hello Gadget | Press `F1` to increment the local count. Switch away and return. The counter is retained across focus changes, and the Pulse Service count advances in the background. |
+| `Hyper` + `F6` · System | Check battery percentage and charging state when connected to USB. Wait for the CPU sample and check heap, stack, reel timing, Wi-Fi, PCM audio and service status. Use `F1` and `F2` to page through the service list when it exceeds four entries. |
 
 While both services are active, press `Esc` once and check that Gadget stays open. Hold the key and check again, then release it and press it twice within 850 ms to exit to the launcher. Reopen Gadget and check the Weather city, Clock time preference, saved stations, last station selection and both speaker and headphone levels. Radio starts playback when you press Enter. With serial logs, look for `Playing live`, `Forecast updated` and the worker unload messages.
 
-Gadget saves each module's state under `/sd/data/<slug>/<module-id>/`. The `internet_radio/stations.txt` catalog uses TanRadio's text format. Gadget plays direct MP3 URLs. You can also specify a stream with `settings.station_url` and `settings.station_name` in Radio's installed SD manifest. On first launch, Weather can seed its saved city from `settings.location` in its installed SD manifest. The release starts with an empty Weather location and public Radio presets.
+Gadget saves each module's state under `/sd/data/<slug>/<module-id>/`. On first launch, Weather can seed its saved city from `settings.location` in its installed SD manifest. The release starts with an empty Weather location.
 
 ### Tuning validation
 
@@ -128,7 +128,7 @@ On 2026-11-20, the default and fresh ESP32-P4 builds produced a 1,478,080-byte G
 
 With passive serial monitoring, Gadget switched through all six faces during 56 seconds of Radio playback with zero reported PCM underruns or output errors. Uninterrupted reel transitions used PPA and logged p95 presentation intervals of 68–84 ms while Radio played. The same session captured clean unloading of all six modules, the return to launcher v0.3.1 and a relaunch to Clock.
 
-1. Launch Gadget with the full SD package, then with one optional face module removed. Confirm that the guide displays each loaded name, marks the vacant slot Empty, and opens F1 after about three seconds. Press `Enter` on another launch to continue as soon as the catalog is ready.
+1. Launch Gadget with the full SD package, then with one optional face module removed. Confirm that the guide displays each loaded name and marks the vacant slot Empty. Wait on the guide, then press `Space` to open slot 1.
 2. Hold `Hyper` + `F2` from F1 and check that F2 enters from the top. Try F1 to F6 for an upward wrap, then F1 to F4 and back for downward ties. The faces stay upright and retain their proportions. Retarget during a spin and check that the last selection takes focus.
 3. Tap and release `Hyper` and press a function key within two seconds. Try a second function key, an intervening key, and a function key after expiry. Open the guide with `Hyper` + `H`. Press `Enter` to return to the current face, then reopen the guide and press `Esc` twice within 850 ms to return to the launcher.
 4. Play Radio while switching faces and while the guide is open. Check for audible gaps and PCM underruns. The display log reports reel frame count, p95 presentation interval, peak drawing and scaling times, and scanout wait.
@@ -140,9 +140,30 @@ With passive serial monitoring, Gadget switched through all six faces during 56 
 
 These findings were recorded on SD revision 6. The proposed changes to start module workers after the startup guide and reset the radio transport on first network use were deferred. The later revision 7 run established a performance baseline for normal operation. [M4 hardware validation](#m4-hardware-validation)
 
+## Internet Radio
+
+Gadget 0.6.0, SD revision 10, includes Radio 0.4.2. Open it with `Hyper` + `F2` in the default layout. The Now Playing pane follows the active stream while you browse the station list. Radio plays direct HTTP(S) MP3 streams and displays the current track or programme when a stream supplies an ICY title. Playback continues across workspace changes. The physical volume controls adjust the active speaker or headphone level, and Gadget remembers each level separately. [Radio architecture](ARCHITECTURE.md#radio-playback-and-directory)
+
+| Action | Controls |
+|---|---|
+| Play | Use the arrows to highlight a station and `Enter` to tune it. `F4` tunes the highlighted station or toggles mute if that station is already tuned. `F3` stops playback. `F5` tunes the next station or saves a highlighted preview to the station list. |
+| Add by URL | Press `F1` from the station list and enter a name and direct MP3 URL. `Tab` or Up/Down switches fields. Left/Right and Backspace edit the text. Press `Enter` or `F4` to save, or `F2` to cancel. |
+| Find and save | Press `F2` to open Radio Browser search. `Tab` switches between name and country. Enter a name, country name or two-letter country code as appropriate, then press `Enter`. Use the arrows to browse, `F4` to preview, and `F5` to save the highlighted result. `F2` returns to the list. |
+| Remove | Highlight a saved station or preset and press `F6` or Backspace. `Enter` or `F4` confirms and `F2` cancels. If the station is playing, it remains a preview until you stop or tune another station. |
+
+Radio confirms station changes after Gadget writes them to `/sd/data/<slug>/internet_radio/stations.txt`. The catalog uses TanRadio's `name:::url:::country:::codec:::bitrate` records and retains existing comments and entries for other codecs. Gadget identifies directory duplicates by station UUID or stream URL. Removing a bundled preset adds a catalog comment that hides its URL on later launches. The source ships with three public SomaFM presets. A device-specific installation can supply a stream through `settings.station_url` and `settings.station_name` in Radio's installed SD manifest. [Reference sources and licenses](REFERENCE_SOURCES.md)
+
+### Tanmatsu radio validation
+
+On 2026-11-23, the user confirmed that Radio 0.4.1 passed their Tanmatsu hardware tests. The test install was **Gadget Radio Test**, an SD revision 8 development build with the updated Radio module and runtime. BadgeLink matched all 20 installed files against the staged package. The tested `gadget.bin` had SHA-256 `c059abff66bf898bca52910fe928703dbb64401eb18ccc6948c32e8a9cf8e9ea`.
+
+The Gadget 0.5.1 build matched the tested module packages byte for byte. The core image differed only in its application descriptor and integrity footer. The SD revision 9 package passed the repository metadata and asset checks.
+
+Host checks covered the player and search layouts, UTF-8 station entry, add and remove with SD reload, failed-write retry, preset removal and re-addition, ICY metadata split across reads, and speaker and headphone output lifecycle. For a repeat device check, add a direct stream, preview and save a directory result, then remove a preset and the playing station. Exit with double `Esc` and relaunch to verify the saved list. While playing, test mute, Stop, headphone switching and a workspace change.
+
 ## Workspace settings
 
-Open the guide with `Hyper` + `H` and press `C` to edit the layout. Use Up/Down to select a slot and Left/Right to swap its face with the adjacent slot. Press `S` to edit shortcuts using the same controls, or `D` to restore the manifest defaults and the original key order. `Enter` queues the settings for an SD write. Use `Backspace` to return to the guide and double `Esc` to exit cleanly. The next launch reads the new layout. The guide always shows the active key bindings.
+Open the guide with `Hyper` + `H` and press `F1` to edit the layout. Use Up/Down to select a slot and Left/Right to swap its face with the adjacent slot. Press `F1` to switch between editing face order and shortcuts, or `F3` to restore the manifest defaults and the original key order. `F4` queues the settings for an SD write. Use `F2` to return to the guide and double `Esc` to exit cleanly. The next launch reads the new layout. The guide always shows the active key bindings.
 
 Gadget's layout file is `/sd/data/<slug>/_runtime/settings.json`. To edit it on a host, close Gadget first. The example places Radio in slot 1, Clock in slot 2, and maps `Hyper` + `F3` to slot 6.
 
@@ -198,16 +219,26 @@ CPU busy percentages use per-core FreeRTOS idle-counter differences over the sam
 
 ## M5 release validation
 
-Gadget 0.5.0 uses Tanmatsu SD revision 8. Use a fresh source copy to build the ESP32-P4 image and generate the package. Check the image integrity and each module's RV32 ELF format. Verify the metadata against the app repository schema and compare its executable, icons and assets to the packaged files. Check the source and package contents, including firmware strings, for private data before copying them to either release checkout.
+The first Gadget release was 0.5.0, Tanmatsu SD revision 8. Use a fresh source copy to build the ESP32-P4 image and generate the package. Check the image integrity and each module's RV32 ELF format. Verify the metadata against the app repository schema and compare its executable, icons and assets to the packaged files. Check the source and package contents, including firmware strings, for private data before copying them to either release checkout. [Gadget 0.5.1 radio validation](#tanmatsu-radio-validation)
 
 The source-only build produced a 1,487,536-byte core with a valid ESP32-P4 checksum and validation hash. Both the development and repository packages passed the official metadata validator. Host checks covered the retained launcher path, and the production loader opened seven bundled modules and two independently scaffolded modules under RISC-V emulation. The external face rendered and the external service published an event and stopped on request. The Tanmatsu checks below are pending.
 
 ### Tanmatsu release checks
 
 1. Open the repository entry with the SD card absent and check that installation requires the card. Mount SD and install. Verify the app folder, three icons, consolidated license and seven module packages on the card.
-2. Launch Gadget. Check that the launcher caches and starts the ESP32-P4 core, the startup guide lists all six faces, and Hello Gadget's Enter count and Pulse Service ticks advance. Use the [SDK quick start](MODULE_SDK.md#build-and-install) to install a separately built face and service. Relaunch and verify the face renders and the service appears in System.
+2. Launch Gadget. Check that the launcher caches and starts the ESP32-P4 core and that the guide lists all six faces and waits for `Space`. Check that `F1` increments the Hello Gadget counter and Pulse Service ticks advance. Use the SDK quick start to install a separately built face and service. Relaunch and verify the face renders and the service appears in System. [SDK quick start](MODULE_SDK.md#build-and-install)
 3. Save a layout change, update a previous installation using the existing slug, and reopen Gadget. Verify the launcher uses the new revision, the saved settings remain available, and Radio and Weather still use their saved settings. Try a launch with the SD app folder unavailable and check the on-screen recovery prompt.
 4. Press `Esc` twice within 850 ms and confirm the launcher returns after Gadget stops its workers and flushes settings. Start Gadget again and verify the saved layout.
+
+## Gadget 0.6.0 validation
+
+On 2026-11-23, the user confirmed their Tanmatsu checks passed for Gadget 0.6.0, SD revision 10. This release adds the Space startup prompt, a short power-button press to blank and wake the screen and keyboard lights, a battery indicator in System and function-key action labels. Double `Esc` returns to the launcher.
+
+BadgeLink read back all 20 staged SD files byte for byte after upgrading the existing Gadget installation. The tested 1,494,320-byte `gadget.bin` had SHA-256 `914c9498e2ca8e31ffebf5bc3f6ebc9c76ee91298ee931791cf9abeff74942c7`. The ESP32-P4 image checksum and validation hash passed.
+
+Host checks covered the 850 ms exit window, Space gating, layout shortcuts, backlight restoration and failure recovery, the battery sample cache and older SDK table, and Radio's contextual `F5` save action. The release package includes seven RV32 module ELFs.
+
+A fresh source build reproduced the seven module ELFs byte for byte. Its core image differed only in the ESP application descriptor and integrity footer. Both SD packages passed the app repository metadata validator. The published package uses the Tanmatsu-tested image.
 
 ## M0 starter smoke test
 

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Open-Meteo requests and geocoding adapted from Weather, copyright (c) 2026 Weather project.
 #include "forecast.h"
+#include "gadget_keycap.h"
 
 #include <string.h>
 
 #define CITY_BYTES 48
 #define BODY_BYTES 8192
+#define WEATHER_LOCATION_KEY GADGET_KEY_F1
+#define WEATHER_REFRESH_KEY GADGET_KEY_F2
 
 typedef enum {
     NO_LOCATION,
@@ -318,11 +321,12 @@ static void input(gadget_module_context_t *module, const gadget_key_t *key)
                 editing_city[editing_length] = '\0';
             }
         }
-    } else if (key->kind == GADGET_KEY_TEXT && (key->text[0] == 'l' || key->text[0] == 'L')) {
+    } else if (key->kind == WEATHER_LOCATION_KEY ||
+               (key->kind == GADGET_KEY_TEXT && (key->text[0] == 'l' || key->text[0] == 'L'))) {
         editing = true;
         editing_length = 0;
         editing_city[0] = '\0';
-    } else if (key->kind == GADGET_KEY_ENTER && request.city[0] != '\0') {
+    } else if ((key->kind == WEATHER_REFRESH_KEY || key->kind == GADGET_KEY_ENTER) && request.city[0] != '\0') {
         refresh(module);
     } else {
         return;
@@ -354,6 +358,12 @@ static void render_forecast(gadget_module_context_t *module, const gadget_canvas
     }
 }
 
+static void action(const gadget_canvas_t *canvas, int x, int y, gadget_key_kind_t key, const char *label)
+{
+    gadget_draw_function_key(canvas, x, y, key, 0xff253648, accent);
+    canvas->text(canvas->handle, x + GADGET_KEYCAP_WIDTH + 8, y + 2, 16, muted, label);
+}
+
 static void render(gadget_module_context_t *module, const gadget_canvas_t *canvas)
 {
     if (editing) {
@@ -366,7 +376,7 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
     }
     if (request.city[0] == '\0') {
         canvas->text(canvas->handle, margin, 28, 36, text, "No weather location");
-        canvas->text(canvas->handle, margin, 88, 21, muted, "Press L to enter a city or postal code.");
+        action(canvas, margin, 88, WEATHER_LOCATION_KEY, "Enter a city or postal code");
         return;
     }
 
@@ -397,15 +407,16 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
                              view.updated_at);
         status = line;
         break;
-    case LOCATION_UNKNOWN: status = "Location not found. Press L to change it."; break;
+    case LOCATION_UNKNOWN: status = "Location not found. Choose another city."; break;
     case OFFLINE: status = view.cached ? "Offline. Showing the last forecast." : "Offline. Waiting for Wi-Fi."; break;
     case PROVIDER_ERROR: status = view.cached ? "Update failed. Showing the last forecast." : "Weather provider unavailable."; break;
     default: status = "Refreshing forecast..."; break;
     }
     canvas->text(canvas->handle, margin, view.cached ? 173 : 91, 17, view.status == READY ? muted : accent, status);
-    canvas->text(canvas->handle, margin, canvas->height - 44, 16, muted,
-                 "L  Location    Enter  Refresh    Hyper + R  Refresh from any face");
-    canvas->text(canvas->handle, canvas->width - 181, canvas->height - 44, 16, muted, "Data by Open-Meteo");
+    const int footer = canvas->height - 44;
+    action(canvas, margin, footer, WEATHER_LOCATION_KEY, "Location");
+    action(canvas, margin + 115, footer, WEATHER_REFRESH_KEY, "Refresh");
+    canvas->text(canvas->handle, canvas->width - 181, footer + 2, 16, muted, "Data by Open-Meteo");
 }
 
 static const gadget_module_t hooks = {

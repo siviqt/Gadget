@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdio.h>
 
+#include "bsp/power.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -12,6 +13,35 @@
 
 static const char *const TAG = "gadget_metrics";
 static gadget_system_status_t status;
+static gadget_battery_status_t battery;
+static uint64_t next_battery_ms;
+static bool battery_valid;
+
+static void measure_battery(void)
+{
+    const uint64_t now = gadget_services_uptime_ms();
+    if (now < next_battery_ms) {
+        return;
+    }
+    next_battery_ms = now + 15000;
+    bsp_power_battery_information_t reading;
+    battery_valid = bsp_power_get_battery_information(&reading) == ESP_OK;
+    if (!battery_valid) {
+        return;
+    }
+
+    const double percent = reading.remaining_percentage;
+    if (reading.battery_available && !(percent >= 0.0 && percent <= 100.0)) {
+        battery_valid = false;
+        return;
+    }
+    battery = (gadget_battery_status_t){
+        .percent = reading.battery_available ? (uint8_t)(percent + 0.5) : 0,
+        .present = reading.battery_available,
+        .charging = reading.battery_available && reading.battery_charging,
+        .external_power = reading.power_supply_available,
+    };
+}
 
 static gadget_heap_status_t measure_heap(uint32_t capabilities)
 {
@@ -62,6 +92,7 @@ void gadget_services_measure(void)
     gadget_services_measure_stack("main", uxTaskGetStackHighWaterMark(NULL));
     gadget_audio_measure_stack();
     gadget_motion_measure_stack();
+    measure_battery();
 }
 
 void gadget_services_system_status(gadget_system_status_t *result)
@@ -69,6 +100,14 @@ void gadget_services_system_status(gadget_system_status_t *result)
     *result = status;
     result->wifi = gadget_services_wifi_status();
     result->pcm = gadget_audio_status();
+}
+
+bool gadget_services_battery_status(gadget_battery_status_t *result)
+{
+    if (battery_valid) {
+        *result = battery;
+    }
+    return battery_valid;
 }
 
 void gadget_services_log_metrics(void)

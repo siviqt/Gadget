@@ -46,6 +46,7 @@ struct module_instance {
     kbelf_dyn image;
     const gadget_module_t *hooks;
     cJSON *saved_settings;
+    atomic_uint write_status;
     bool reading_state;
     module_worker_t workers[WORKER_LIMIT];
     unsigned worker_count;
@@ -211,15 +212,28 @@ static bool host_network_connected(gadget_module_context_t *context)
            !atomic_load(&module->stopping) && gadget_services_network_connected();
 }
 
-static gadget_http_stream_t *host_http_open(gadget_module_context_t *context, const char *url, int *status)
+static gadget_http_stream_t *open_module_stream(gadget_module_context_t *context, const char *url, int *status,
+                                                uint32_t *interval)
 {
     module_instance_t *module = (module_instance_t *)context;
     module_worker_t *worker = current_worker(module);
     if (!(module->manifest.capabilities & MODULE_NETWORK) || worker == NULL || worker->stream != NULL) {
         return NULL;
     }
-    worker->stream = gadget_services_http_open(url, status, &module->stopping);
+    worker->stream = interval != NULL ? gadget_services_http_open_icy(url, status, interval, &module->stopping)
+                                      : gadget_services_http_open(url, status, &module->stopping);
     return worker->stream;
+}
+
+static gadget_http_stream_t *host_http_open(gadget_module_context_t *context, const char *url, int *status)
+{
+    return open_module_stream(context, url, status, NULL);
+}
+
+static gadget_http_stream_t *host_http_open_icy(gadget_module_context_t *context, const char *url, int *status,
+                                                uint32_t *interval)
+{
+    return interval != NULL ? open_module_stream(context, url, status, interval) : NULL;
 }
 
 static int host_http_read(gadget_module_context_t *context, gadget_http_stream_t *stream, void *data, size_t size)
@@ -436,12 +450,32 @@ static int host_state_read_file(gadget_module_context_t *context, const char *fi
            ? gadget_config_read(module->manifest.id, filename, copy, out, capacity) : GADGET_STATE_FILE_UNREADABLE;
 }
 
+static bool state_file_writable(module_instance_t *module, const char *filename)
+{
+    return (module->manifest.capabilities & MODULE_STORAGE) && current_worker(module) == NULL && filename != NULL &&
+           strcasecmp(filename, GADGET_SETTINGS_FILE) != 0;
+}
+
 static bool host_state_write_file(gadget_module_context_t *context, const char *filename, const void *data, size_t size)
 {
     module_instance_t *module = (module_instance_t *)context;
-    return (module->manifest.capabilities & MODULE_STORAGE) && current_worker(module) == NULL && filename != NULL &&
-           strcasecmp(filename, GADGET_SETTINGS_FILE) != 0 &&
+    return state_file_writable(module, filename) &&
            gadget_config_write(module->manifest.id, filename, data, size);
+}
+
+static bool host_state_write_file_checked(gadget_module_context_t *context, const char *filename,
+                                          const void *data, size_t size)
+{
+    module_instance_t *module = (module_instance_t *)context;
+    return state_file_writable(module, filename) &&
+           gadget_config_write_checked(module->manifest.id, filename, data, size, &module->write_status);
+}
+
+static gadget_state_write_status_t host_state_write_status(gadget_module_context_t *context)
+{
+    module_instance_t *module = (module_instance_t *)context;
+    return (module->manifest.capabilities & MODULE_STORAGE) && current_worker(module) == NULL
+           ? (gadget_state_write_status_t)atomic_load(&module->write_status) : GADGET_STATE_WRITE_IDLE;
 }
 
 static bool host_system_status(gadget_module_context_t *context, gadget_system_status_t *status)
@@ -475,6 +509,12 @@ static bool host_system_service(gadget_module_context_t *context, unsigned index
         }
     }
     return false;
+}
+
+static bool host_battery_status(gadget_module_context_t *context, gadget_battery_status_t *status)
+{
+    return status != NULL && current_worker((module_instance_t *)context) == NULL &&
+           gadget_services_battery_status(status);
 }
 
 static const gadget_host_t host = {
@@ -518,6 +558,10 @@ static const gadget_host_t host = {
     .audio_headphones = gadget_services_audio_headphones,
     .system_status = host_system_status,
     .system_service = host_system_service,
+    .state_write_file_checked = host_state_write_file_checked,
+    .state_write_status = host_state_write_status,
+    .http_open_icy = host_http_open_icy,
+    .battery_status = host_battery_status,
 };
 
 static void run_worker(void *argument)
@@ -765,6 +809,7 @@ void gadget_modules_start(const char *root, const gadget_layout_t *layout)
     for (unsigned i = 0; i < catalog_size; ++i) {
         module_instance_t *module = &catalog[i];
         atomic_init(&module->stopping, false);
+        atomic_init(&module->write_status, GADGET_STATE_WRITE_IDLE);
         module->shared_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
         for (unsigned j = i + 1; j < catalog_size; ++j) {
             if (strcmp(module->manifest.id, catalog[j].manifest.id) == 0) {

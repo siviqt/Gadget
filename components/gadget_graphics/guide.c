@@ -1,9 +1,33 @@
 #include "drawing.h"
+#include "gadget_keycap.h"
 
 #include <stdio.h>
 
 static const uint32_t accent = 0xff6ed9ed;
 static const uint32_t rule = 0xff324657;
+static const uint32_t key_fill = 0xff263b4a;
+
+static void keycap_rect(void *surface, int x, int y, int w, int h, uint32_t color)
+{
+    pax_draw_rect(surface, color, x, y, w, h);
+}
+
+static void keycap_text(void *surface, int x, int y, unsigned pixels, uint32_t color, const char *text)
+{
+    gadget_text(surface, color, pixels, x, y, text);
+}
+
+static void keycap(pax_buf_t *surface, int x, int y, gadget_key_kind_t key)
+{
+    const gadget_canvas_t canvas = {.handle = surface, .rect = keycap_rect, .text = keycap_text};
+    gadget_draw_function_key(&canvas, x, y, key, key_fill, accent);
+}
+
+static void action(pax_buf_t *surface, int x, int y, gadget_key_kind_t key, const char *text)
+{
+    keycap(surface, x, y, key);
+    gadget_text(surface, GADGET_TEXT, 16, x + GADGET_KEYCAP_WIDTH + 8, y + 2, text);
+}
 
 void gadget_draw_guide(pax_buf_t *surface, gadget_guide_t guide)
 {
@@ -38,10 +62,7 @@ void gadget_draw_guide(pax_buf_t *surface, gadget_guide_t guide)
         const int label_x = map_x + 57;
         for (unsigned face = 0; face < GADGET_FACE_COUNT; ++face) {
             const int y = map_y + 35 + (int)face * 42;
-            char key[8];
-            snprintf(key, sizeof(key), "F%u", gadget_workspace_function_key(face));
-            pax_draw_rect(surface, 0xff263b4a, map_x, y, 43, 28);
-            gadget_text(surface, accent, 18, map_x + 11, y + 2, key);
+            keycap(surface, map_x, y, GADGET_KEY_F1 + gadget_workspace_function_key(face) - 1);
             pax_clip(surface, label_x, y, width - margin - label_x, 29);
             gadget_text(surface, GADGET_TEXT, 18, label_x, y + 2, gadget_workspace_name(face));
             pax_noclip(surface);
@@ -49,12 +70,12 @@ void gadget_draw_guide(pax_buf_t *surface, gadget_guide_t guide)
     }
 
     const char *status = guide == GADGET_GUIDE_LOADING ? "Loading modules from SD..."
-                       : guide == GADGET_GUIDE_READY ? "Enter to continue"
+                       : guide == GADGET_GUIDE_READY ? "Press Space to continue"
                        : "Enter to return to your workspace";
     pax_draw_rect(surface, rule, margin, footer, width - 2 * margin, 1);
     gadget_text(surface, accent, 18, margin, footer + 17, status);
-    if (guide != GADGET_GUIDE_LOADING) {
-        gadget_text(surface, accent, 18, wide ? map_x : margin + 280, footer + 17, "C  Layout");
+    if (guide == GADGET_GUIDE_HELP) {
+        action(surface, wide ? map_x : margin + 280, footer + 16, GADGET_GUIDE_LAYOUT_KEY, "Layout");
     }
     pax_join();
 }
@@ -82,14 +103,15 @@ void gadget_draw_layout(pax_buf_t *surface, const gadget_layout_view_t *view)
         pax_clip(surface, face_x, y, key_x - face_x - 12, 33);
         gadget_text(surface, GADGET_TEXT, 18, face_x, y + 5, view->names[i]);
         pax_noclip(surface);
-        snprintf(label, sizeof(label), "Hyper + F%u", view->function_keys[i]);
-        gadget_text(surface, GADGET_TEXT, 18, key_x, y + 5, label);
+        gadget_text(surface, GADGET_TEXT, 16, key_x, y + 6, "Hyper +");
+        keycap(surface, key_x + 67, y + 5, GADGET_KEY_F1 + view->function_keys[i] - 1);
     }
     pax_draw_rect(surface, rule, margin, footer, width - 2 * margin, 1);
     gadget_text(surface, GADGET_MUTED, 16, margin, footer + 9, "Up/Down Select   Left/Right Swap");
-    gadget_text(surface, GADGET_MUTED, 16, margin, footer + 32, view->edit_shortcuts ?
-                "S  Edit face order   D  Defaults" : "S  Edit shortcuts   D  Defaults");
-    gadget_text(surface, GADGET_TEXT, 16, margin, footer + 55, "Enter  Save   Backspace  Guide");
+    action(surface, margin, footer + 31, GADGET_LAYOUT_MODE_KEY, view->edit_shortcuts ? "Edit face order" : "Edit shortcuts");
+    action(surface, width / 2, footer + 31, GADGET_LAYOUT_DEFAULTS_KEY, "Defaults");
+    action(surface, margin, footer + 56, GADGET_LAYOUT_BACK_KEY, "Guide");
+    action(surface, width / 2, footer + 56, GADGET_LAYOUT_SAVE_KEY, "Save");
     if (view->notice != NULL) {
         gadget_text(surface, accent, 16, margin, footer + 78, view->notice);
     }

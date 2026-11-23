@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "bsp/display.h"
+#include "bsp/tanmatsu.h"
 #include "driver/ppa.h"
 #include "esp_attr.h"
 #include "esp_check.h"
@@ -14,6 +15,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "tanmatsu_coprocessor.h"
 
 #define GAP_BUCKET_MS 2
 #define GAP_BUCKETS 76
@@ -52,6 +54,9 @@ static struct {
     uint64_t workspace_report_at;
     bool settled, moving;
     bool big_endian;
+    bool blanked, restore_lights;
+    uint8_t lcd_pwm, keyboard_pwm;
+    tanmatsu_coprocessor_handle_t backlight;
 } display;
 
 static StaticSemaphore_t refresh_storage;
@@ -145,8 +150,69 @@ esp_err_t gadget_graphics_init(void)
     return ESP_OK;
 }
 
+static void restore_backlights(void)
+{
+    if (!display.restore_lights) {
+        return;
+    }
+    const esp_err_t lcd = tanmatsu_coprocessor_set_display_backlight(display.backlight, display.lcd_pwm);
+    const esp_err_t keyboard = tanmatsu_coprocessor_set_keyboard_backlight(display.backlight, display.keyboard_pwm);
+    display.restore_lights = lcd != ESP_OK || keyboard != ESP_OK;
+    if (display.restore_lights) {
+        ESP_LOGW(TAG, "Backlight restore: display %s, keyboard %s", esp_err_to_name(lcd), esp_err_to_name(keyboard));
+    }
+}
+
+bool gadget_graphics_blanked(void)
+{
+    return display.blanked;
+}
+
+esp_err_t gadget_graphics_set_blanked(bool blanked)
+{
+    if (blanked == display.blanked) {
+        return ESP_OK;
+    }
+    if (!blanked) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(display.panel, true), TAG, "Unable to enable the LCD");
+        display.blanked = false;
+        return ESP_OK;
+    }
+
+    if (!display.restore_lights) {
+        // Cache raw PWM so percentage conversion cannot dim the lights over repeated wake cycles.
+        ESP_RETURN_ON_ERROR(bsp_tanmatsu_coprocessor_get_handle(&display.backlight), TAG, "Backlight control unavailable");
+        ESP_RETURN_ON_ERROR(tanmatsu_coprocessor_get_display_backlight(display.backlight, &display.lcd_pwm),
+                            TAG, "Unable to read display brightness");
+        ESP_RETURN_ON_ERROR(tanmatsu_coprocessor_get_keyboard_backlight(display.backlight, &display.keyboard_pwm),
+                            TAG, "Unable to read keyboard brightness");
+    }
+    display.restore_lights = true;
+    esp_err_t result = tanmatsu_coprocessor_set_keyboard_backlight(display.backlight, 0);
+    if (result == ESP_OK) {
+        result = tanmatsu_coprocessor_set_display_backlight(display.backlight, 0);
+    }
+    if (result == ESP_OK) {
+        result = esp_lcd_panel_disp_on_off(display.panel, false);
+    }
+    if (result != ESP_OK) {
+        esp_lcd_panel_disp_on_off(display.panel, true);
+        restore_backlights();
+        return result;
+    }
+    display.blanked = true;
+    return ESP_OK;
+}
+
 void gadget_graphics_shutdown(void)
 {
+    if (display.blanked) {
+        const esp_err_t result = esp_lcd_panel_disp_on_off(display.panel, true);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Unable to enable the LCD before exit: %s", esp_err_to_name(result));
+        }
+    }
+    restore_backlights();
     if (display.refresh != NULL) {
         const esp_lcd_dpi_panel_event_callbacks_t callbacks = {0};
         esp_lcd_dpi_panel_register_event_callbacks(display.panel, &callbacks, NULL);
@@ -160,6 +226,9 @@ void gadget_graphics_shutdown(void)
 
 static esp_err_t present(int first_row, int end_row)
 {
+    if (display.blanked) {
+        return ESP_OK;
+    }
     ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(display.panel, 0, first_row, display.width, end_row,
                                                   pax_buf_get_pixels(&display.pages[display.writable_page])),
                         TAG, "Page flip failed");
@@ -172,6 +241,7 @@ static esp_err_t present(int first_row, int end_row)
     }
     display.shown_page = display.writable_page;
     display.writable_page ^= 1;
+    restore_backlights();
     return ESP_OK;
 }
 

@@ -51,6 +51,8 @@ Replace the corresponding installed example folders when testing rebuilt copies 
 
 - `init` runs once on the main runtime task. `shutdown` releases resources after normal exit or a failed `init`.
 - `activate` and `deactivate` follow workspace focus. `input` receives normalized navigation and UTF-8 text events while the face is focused. Gadget handles its global workspace shortcuts and the double `Esc` exit gesture.
+- The focused face can handle bare `F1`–`F6` and `Tab` navigation events. The Hyper chords and the two-second Hyper latch still select workspaces.
+- Include `gadget_keycap.h` to draw an `F1`–`F6` keycap using the same `GADGET_KEY_F*` value as the input binding.
 - `update` runs on the active face at the manifest's requested interval. Call `invalidate` to request a redraw. `render` borrows a clipped canvas with panel-relative coordinates and rectangle and text drawing callbacks. Use `canvas->width` and `canvas->height` for layout. Canvas handles are valid until `render` returns.
 - `service_start` runs after initialization. `worker` is optional and runs on a separate task regardless of workspace focus. A worker blocks or paces itself through `wait_for_stop`. Gadget signals workers and joins them before `service_stop` and `shutdown`.
 - `publish` copies the sender ID, topic and integer value into a bounded queue. It returns `false` if the queue is full or the sender is stopping. `event` callbacks run on the runtime task, including for inactive faces. Store data there and let Gadget redraw the active face.
@@ -92,3 +94,10 @@ Gadget 0.3.2 adds SD state, hardware volume events and text measurement to SDK v
 - The canvas `text_bounds` callback measures the ink rectangle and advance of a single line using the same bitmap font as `text`. Its offsets are relative to the draw origin. It returns false for empty text, unsupported glyphs or invalid input.
 
 Gadget 0.4.0 appends `system_status` and `system_service` to the SDK v1 host table. Check both with `GADGET_HOST_HAS` and call them from runtime callbacks. `system_status` copies the latest heap, CPU, stack and transition measurements, current Wi-Fi and PCM states, and loaded module and service counts. `cpu_count` becomes available after a second sample. `system_service` takes a zero-based service index and copies the loaded service's name and registered and running worker counts. A worker waiting for work counts as running until its entry callback returns.
+
+Gadget 0.5.1 adds optional checked file writes and ICY requests to SDK v1.
+
+- Use the optional `state_write_file_checked` and `state_write_status` callbacks to show the result of an explicit SD file write. Check both with `GADGET_HOST_HAS`. The runtime copies the supplied bytes and accepts one checked write at a time per module. The status reports pending, saved, or failed. The filesystem write runs on the storage worker and is flushed on clean exit.
+- `http_open_icy` is an optional alternative to `http_open` for a network worker that can handle ICY framing. The call requests stream metadata and returns the number of audio bytes between metadata blocks. An interval of zero indicates unframed audio.
+
+Gadget 0.6.0 appends the optional `battery_status` callback. Check it with `GADGET_HOST_HAS` and call it from a runtime callback. A successful call returns the cached battery presence, estimated charge percentage, charging state and external power state. The runtime reads the battery about every 15 seconds.

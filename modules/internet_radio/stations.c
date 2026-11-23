@@ -7,12 +7,15 @@
 #define STATION_LIMIT 128
 #define STATION_FILE "stations.txt"
 #define UUID_COMMENT "#RADIOBROWSERUUID:"
+#define EMPTY_CATALOG "#GADGETEMPTY"
+#define HIDDEN_PRESET "#GADGETHIDDENPRESET:"
 
 static radio_station_t saved[STATION_LIMIT];
 static unsigned count;
 static char contents[GADGET_STATE_FILE_LIMIT + 1];
-static size_t length;
-static bool unreadable;
+static char draft[sizeof(contents)];
+static size_t length, draft_length;
+static bool unreadable, writing, pending_uuid;
 
 bool radio_uuid_valid(const char *uuid)
 {
@@ -37,8 +40,18 @@ static char lower_hex(char ch)
     return ch >= 'A' && ch <= 'F' ? ch + ('a' - 'A') : ch;
 }
 
-static bool same_station(const radio_station_t *a, const radio_station_t *b)
+bool radio_same_url(const radio_station_t *a, const radio_station_t *b)
 {
+    const size_t size = radio_text_length(a->url, RADIO_URL_BYTES);
+    return size != 0 && size < RADIO_URL_BYTES && size == radio_text_length(b->url, RADIO_URL_BYTES) &&
+           memcmp(a->url, b->url, size) == 0;
+}
+
+bool radio_same_station(const radio_station_t *a, const radio_station_t *b)
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
     if (a->uuid[0] != '\0' && b->uuid[0] != '\0') {
         bool same = true;
         for (unsigned i = 0; i < RADIO_UUID_BYTES - 1; ++i) {
@@ -48,15 +61,13 @@ static bool same_station(const radio_station_t *a, const radio_station_t *b)
             return true;
         }
     }
-    const size_t size = radio_text_length(a->url, RADIO_URL_BYTES);
-    return size != 0 && size < RADIO_URL_BYTES && size == radio_text_length(b->url, RADIO_URL_BYTES) &&
-           memcmp(a->url, b->url, size) == 0;
+    return radio_same_url(a, b);
 }
 
 static bool duplicate(const radio_station_t *station)
 {
     for (unsigned i = 0; i < count; ++i) {
-        if (same_station(station, &saved[i])) {
+        if (radio_same_station(station, &saved[i])) {
             return true;
         }
     }
@@ -76,6 +87,45 @@ static bool field_ok(const char *field, size_t capacity, bool url)
         }
     }
     return true;
+}
+
+bool radio_station_name_valid(const char *name)
+{
+    return name[0] != '#' && field_ok(name, RADIO_NAME_BYTES, false);
+}
+
+bool radio_station_url_valid(const char *url)
+{
+    if (!radio_http_url(url) || !field_ok(url, RADIO_URL_BYTES, true)) {
+        return false;
+    }
+    const char first = url[url[4] == ':' ? 7 : 8];
+    return first != '/' && first != '?' && first != '#';
+}
+
+bool radio_preset_hidden(const char *url)
+{
+    const size_t prefix = sizeof(HIDDEN_PRESET) - 1;
+    const size_t size = radio_text_length(url, RADIO_URL_BYTES);
+    for (size_t start = 0, end; start < length; start = end + 1) {
+        end = start;
+        while (end < length && contents[end] != '\n') {
+            ++end;
+        }
+        size_t first = start, last = end;
+        while (first < last && (contents[first] == ' ' || contents[first] == '\t')) {
+            ++first;
+        }
+        while (last > first &&
+               (contents[last - 1] == '\r' || contents[last - 1] == ' ' || contents[last - 1] == '\t')) {
+            --last;
+        }
+        if (last - first == prefix + size && memcmp(contents + first, HIDDEN_PRESET, prefix) == 0 &&
+            memcmp(contents + first + prefix, url, size) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static char *trim(char *value)
@@ -106,6 +156,14 @@ static bool parse_record(char *line, radio_station_t *station, bool *mp3)
             fields[3] = trim(line);
             line = separator;
             break;
+        }
+        if (i < 2) {
+            // Older writers could put a field's trailing colon against the separator.
+            const char *end = separator + 3;
+            while (*end == ':') {
+                ++end;
+            }
+            separator += (end - separator) % 3;
         }
         *separator = '\0';
         fields[i] = trim(line);
@@ -143,55 +201,96 @@ static bool parse_record(char *line, radio_station_t *station, bool *mp3)
     return true;
 }
 
-static bool parse_catalog(void)
+typedef struct {
+    size_t position, uuid_start, uuid_end;
+    unsigned invalid;
+    bool empty;
+    char uuid[RADIO_UUID_BYTES];
+} catalog_reader_t;
+
+typedef struct {
+    radio_station_t station;
+    size_t start, end, uuid_start, uuid_end;
+    bool mp3;
+} catalog_record_t;
+
+static bool next_record(catalog_reader_t *reader, catalog_record_t *record)
 {
-    count = 0;
-    char uuid[RADIO_UUID_BYTES] = {0};
-    unsigned records = 0, invalid = 0;
-    for (size_t start = 0, end; start < length; start = end + 1) {
-        end = start;
+    while (reader->position < length) {
+        const size_t start = reader->position;
+        size_t end = start;
         while (end < length && contents[end] != '\n') {
             ++end;
         }
+        reader->position = end < length ? end + 1 : end;
         char buffer[1024];
         const size_t size = end - start;
         if (size >= sizeof(buffer)) {
-            ++invalid;
-            uuid[0] = '\0';
+            ++reader->invalid;
+            reader->uuid[0] = '\0';
+            reader->empty = false;
             continue;
         }
         memcpy(buffer, contents + start, size);
         buffer[size] = '\0';
         char *line = trim(buffer);
         if (line[0] == '#' || line[0] == '\0') {
-            if (radio_text_length(line, sizeof(UUID_COMMENT) - 1) == sizeof(UUID_COMMENT) - 1 &&
+            const bool empty = radio_text_length(line, sizeof(EMPTY_CATALOG)) == sizeof(EMPTY_CATALOG) - 1 &&
+                               memcmp(line, EMPTY_CATALOG, sizeof(EMPTY_CATALOG)) == 0;
+            const size_t prefix = sizeof(HIDDEN_PRESET) - 1;
+            const bool hidden = radio_text_length(line, prefix) == prefix &&
+                                memcmp(line, HIDDEN_PRESET, prefix) == 0 &&
+                                radio_station_url_valid(line + prefix);
+            if (empty) {
+                reader->empty = true;
+            }
+            if (empty || hidden) {
+                reader->uuid[0] = '\0';
+            } else if (radio_text_length(line, sizeof(UUID_COMMENT) - 1) == sizeof(UUID_COMMENT) - 1 &&
                 memcmp(line, UUID_COMMENT, sizeof(UUID_COMMENT) - 1) == 0) {
                 const char *value = line + sizeof(UUID_COMMENT) - 1;
                 if (radio_uuid_valid(value)) {
-                    memcpy(uuid, value, sizeof(uuid));
+                    memcpy(reader->uuid, value, sizeof(reader->uuid));
+                    reader->uuid_start = start;
+                    reader->uuid_end = reader->position;
                 } else {
-                    uuid[0] = '\0';
+                    reader->uuid[0] = '\0';
                 }
             }
             continue;
         }
 
-        radio_station_t station = {0};
-        bool mp3 = false;
-        if (parse_record(line, &station, &mp3)) {
-            ++records;
-            if (mp3 && count < STATION_LIMIT) {
-                memcpy(station.uuid, uuid, sizeof(uuid));
-                if (!duplicate(&station)) {
-                    saved[count++] = station;
-                }
+        *record = (catalog_record_t){.start = start, .end = reader->position};
+        reader->empty = false;
+        if (parse_record(line, &record->station, &record->mp3)) {
+            if (reader->uuid[0] != '\0') {
+                memcpy(record->station.uuid, reader->uuid, sizeof(reader->uuid));
+                record->uuid_start = reader->uuid_start;
+                record->uuid_end = reader->uuid_end;
             }
-        } else {
-            ++invalid;
+            reader->uuid[0] = '\0';
+            return true;
         }
-        uuid[0] = '\0';
+        ++reader->invalid;
+        reader->uuid[0] = '\0';
     }
-    return records != 0 || invalid == 0;
+    return false;
+}
+
+static bool parse_catalog(void)
+{
+    count = 0;
+    catalog_reader_t reader = {0};
+    catalog_record_t record;
+    bool any = false;
+    while (next_record(&reader, &record)) {
+        any = true;
+        if (record.mp3 && count < STATION_LIMIT && !duplicate(&record.station)) {
+            saved[count++] = record.station;
+        }
+    }
+    pending_uuid = reader.uuid[0] != '\0';
+    return any || reader.invalid == 0 || reader.empty;
 }
 
 void radio_load_stations(gadget_module_context_t *module)
@@ -213,6 +312,11 @@ void radio_load_stations(gadget_module_context_t *module)
     // Keep a manually edited catalog intact even if every record is unplayable.
     const int size = module->host->state_read_file(module, STATION_FILE, GADGET_STATE_CURRENT, contents, sizeof(contents));
     length = size >= 0 ? (size_t)size : 0;
+    if (length != 0) {
+        parse_catalog();
+    } else {
+        pending_uuid = false;
+    }
     count = 0;
 }
 
@@ -226,27 +330,123 @@ const radio_station_t *radio_saved_station(unsigned index)
     return index < count ? &saved[index] : NULL;
 }
 
+static void commit_draft(void)
+{
+    memcpy(contents, draft, draft_length);
+    contents[draft_length] = '\0';
+    length = draft_length;
+    parse_catalog();
+}
+
+static radio_save_t write_draft(gadget_module_context_t *module)
+{
+    if (GADGET_HOST_HAS(module->host, state_write_status) &&
+        GADGET_HOST_HAS(module->host, state_write_file_checked)) {
+        writing = module->host->state_write_file_checked(module, STATION_FILE, draft, draft_length);
+        return writing ? RADIO_SAVE_PENDING : RADIO_SAVE_FAILED;
+    }
+    if (!module->host->state_write_file(module, STATION_FILE, draft, draft_length)) {
+        return RADIO_SAVE_FAILED;
+    }
+    commit_draft();
+    return RADIO_SAVE_QUEUED;
+}
+
+gadget_state_write_status_t radio_catalog_write_status(gadget_module_context_t *module)
+{
+    if (!writing) {
+        return GADGET_STATE_WRITE_IDLE;
+    }
+    const gadget_state_write_status_t status = module->host->state_write_status(module);
+    if (status == GADGET_STATE_WRITE_SAVED) {
+        commit_draft();
+    }
+    writing = status == GADGET_STATE_WRITE_PENDING;
+    return status;
+}
+
+static const char *separator_padding(const char *field, size_t capacity)
+{
+    const size_t size = radio_text_length(field, capacity);
+    return size != 0 && field[size - 1] == ':' ? " " : "";
+}
+
 radio_save_t radio_save_station(gadget_module_context_t *module, const radio_station_t *station)
 {
     if (duplicate(station)) {
         return RADIO_DUPLICATE;
     }
-    if (unreadable || count == STATION_LIMIT || station->name[0] == '#' || !field_ok(station->name, RADIO_NAME_BYTES, false) ||
-        !radio_http_url(station->url) || !field_ok(station->url, RADIO_URL_BYTES, true)) {
+    if (writing || unreadable || count == STATION_LIMIT ||
+        !radio_station_name_valid(station->name) || !radio_station_url_valid(station->url)) {
         return RADIO_SAVE_FAILED;
     }
     const bool uuid = radio_uuid_valid(station->uuid);
-    const size_t available = sizeof(contents) - length;
-    const int written = module->host->format(contents + length, available, "%s%s%s%s%s:::%s:::%s:::MP3:::%u\n",
+    const bool comment = uuid || pending_uuid;
+    const size_t available = sizeof(draft) - length;
+    const int written = module->host->format(draft + length, available, "%s%s%s%s%s%s:::%s%s:::%s:::MP3:::%u\n",
                           length && contents[length - 1] != '\n' ? "\n" : "",
-                          uuid ? UUID_COMMENT : "", uuid ? station->uuid : "", uuid ? "\n" : "",
-                          station->name, station->url, station->country, (unsigned)station->bitrate);
-    if (written < 0 || (size_t)written >= available ||
-        !module->host->state_write_file(module, STATION_FILE, contents, length + (size_t)written)) {
-        contents[length] = '\0';
+                          comment ? UUID_COMMENT : "", uuid ? station->uuid : "", comment ? "\n" : "",
+                          station->name, separator_padding(station->name, sizeof(station->name)),
+                          station->url, separator_padding(station->url, sizeof(station->url)),
+                          station->country, (unsigned)station->bitrate);
+    if (written < 0 || (size_t)written >= available) {
         return RADIO_SAVE_FAILED;
     }
-    length += (size_t)written;
-    saved[count++] = *station;
-    return RADIO_SAVED;
+    memcpy(draft, contents, length);
+    draft_length = length + (size_t)written;
+    return write_draft(module);
+}
+
+static void append_range(size_t start, size_t end)
+{
+    memcpy(draft + draft_length, contents + start, end - start);
+    draft_length += end - start;
+}
+
+radio_save_t radio_remove_station(gadget_module_context_t *module, const radio_station_t *station, bool preset)
+{
+    if (writing || unreadable || (preset && !radio_station_url_valid(station->url))) {
+        return RADIO_SAVE_FAILED;
+    }
+    catalog_reader_t reader = {0};
+    catalog_record_t record;
+    size_t preserved = 0;
+    draft_length = 0;
+    while (next_record(&reader, &record)) {
+        if (!record.mp3 || !radio_same_station(station, &record.station)) {
+            continue;
+        }
+        if (record.uuid_end != 0) {
+            append_range(preserved, record.uuid_start);
+            preserved = record.uuid_end;
+        }
+        append_range(preserved, record.start);
+        preserved = record.end;
+    }
+    if (preserved == 0 && !preset) {
+        return RADIO_SAVE_FAILED;
+    }
+    append_range(preserved, length);
+    if (preset) {
+        const size_t available = sizeof(draft) - draft_length;
+        const int written = module->host->format(draft + draft_length, available, "%s%s%s\n",
+            draft_length && draft[draft_length - 1] != '\n' ? "\n" : "", HIDDEN_PRESET, station->url);
+        if (written < 0 || (size_t)written >= available) {
+            return RADIO_SAVE_FAILED;
+        }
+        draft_length += (size_t)written;
+    }
+    if ((count == 0 || (count == 1 && duplicate(station))) && draft_length != 0) {
+        // Keep unrelated lines and distinguish an intentional removal from a damaged primary file.
+        if (draft[draft_length - 1] != '\n') {
+            draft[draft_length++] = '\n';
+        }
+        const char empty[] = EMPTY_CATALOG "\n";
+        if (sizeof(empty) - 1 > GADGET_STATE_FILE_LIMIT - draft_length) {
+            return RADIO_SAVE_FAILED;
+        }
+        memcpy(draft + draft_length, empty, sizeof(empty) - 1);
+        draft_length += sizeof(empty) - 1;
+    }
+    return write_draft(module);
 }

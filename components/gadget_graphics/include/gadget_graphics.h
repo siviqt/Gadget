@@ -16,6 +16,12 @@ typedef enum {
     GADGET_GUIDE_HELP,
 } gadget_guide_t;
 
+#define GADGET_GUIDE_LAYOUT_KEY GADGET_KEY_F1
+#define GADGET_LAYOUT_MODE_KEY GADGET_KEY_F1
+#define GADGET_LAYOUT_BACK_KEY GADGET_KEY_F2
+#define GADGET_LAYOUT_DEFAULTS_KEY GADGET_KEY_F3
+#define GADGET_LAYOUT_SAVE_KEY GADGET_KEY_F4
+
 typedef struct {
     const char *names[GADGET_FACE_COUNT];
     unsigned function_keys[GADGET_FACE_COUNT];
@@ -26,6 +32,8 @@ typedef struct {
 
 esp_err_t gadget_graphics_init(void);
 void gadget_graphics_shutdown(void);
+bool gadget_graphics_blanked(void);
+esp_err_t gadget_graphics_set_blanked(bool blanked);
 const char *gadget_workspace_name(unsigned face);
 unsigned gadget_workspace_function_key(unsigned face);
 void gadget_graphics_prepare_workspace(unsigned face, unsigned function_key, const char *title,

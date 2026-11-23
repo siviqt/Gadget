@@ -5,16 +5,16 @@ The project and revision identify the material used to develop each module. Keep
 | Gadget module | Upstream project and inspected revision | Adaptation starting point |
 |---|---|---|
 | Clock | Chronos at `fb9d6e002b6b1bb13057685ffb1e9f432c21039b` | Inspect `components/chronos_app/features/clock.c` for RTC, system time and time-zone handling. Adapt the date and calendar presentation through the Gadget surface. |
-| Internet Radio | TanRadio at `53a5465be4f1a375495e71c33737f93c8b99ff83` | Review `main/radio/`, `main/audio/` and `main/network/` for bounded buffering, decoding, reconnection and audio output. Put playback state and workers behind the shared service. |
+| Internet Radio | TanRadio at `53a5465be4f1a375495e71c33737f93c8b99ff83` | Adapt the player and search workflows from `main/ui/`, the catalog and ICY framing from `main/radio/`, and the output and DMA shutdown sequence from `main/audio/`. Gadget provides the shared runtime services. |
 | Eyes Mood | Eyes-plugin at `14d33d2269fe862957683c82b17eaf028170bcc4` | Review `src/eyes_engine.c` for animation and moods and `src/widget_display.c` for drawing. Use SDK events and a Gadget surface for animation and input. |
 | Weather | Weather at `8f78b847f369a8d633e6117ad9ee0e00d4710e10` | Review `src/weather.c`, `src/json.c` and `src/config.c` for provider requests, parsing and settings. Refresh through shared network access and hand a cached snapshot to the face. |
 
-## M3 adaptations
+## Bundled adaptations
 
 | Gadget module | Adopted behavior | Notices |
 |---|---|---|
 | [Clock](../modules/clock/) | Chronos civil date arithmetic and RTC-to-local-time approach. Gadget reads the launcher's saved POSIX time zone. | Chronos MIT |
-| [Internet Radio](../modules/internet_radio/) | TanRadio's 256 KiB compressed and PCM buffers, output routing, volume button repeats, reconnect, station search and SD station format. The presets use SomaFM's direct MP3 streams for personal listening. | TanRadio MIT, [Radio Browser API](https://api.radio-browser.info/), [SomaFM direct links](https://somafm.com/groovesalad/directstreamlinks.html) |
+| [Internet Radio](../modules/internet_radio/) | TanRadio's player and search controls, station catalog format, ICY metadata handling, 256 KiB compressed and PCM buffers, volume button repeats and output routing. The presets use SomaFM's direct MP3 streams for personal listening. | TanRadio MIT, [Radio Browser API](https://api.radio-browser.info/), [SomaFM direct links](https://somafm.com/groovesalad/directstreamlinks.html) |
 | [Eyes Mood](../modules/eyes_mood/) | Eyes-plugin gyro direction mapping, tilt response, gaze and lid targets, blinking and elliptical eye drawing, adapted to the Gadget IMU service and canvas. | Eyes-plugin MIT |
 | [Weather](../modules/weather/) | Weather's Open-Meteo geocoding, request fields and metric validation with three days of forecast. Geocoding uses data from GeoNames. | Weather MIT, [Open-Meteo terms and attribution](https://open-meteo.com/en/terms), [Open-Meteo geocoding](https://open-meteo.com/en/docs/geocoding-api) |
 

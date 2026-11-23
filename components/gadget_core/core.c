@@ -25,7 +25,6 @@
 #define APPFS_PATH_OFFSET 13
 #define APPFS_PATH_SIZE 128
 #define MAX_MESSAGES_PER_FRAME 32
-#define STARTUP_GUIDE_US INT64_C(3000000)
 
 static const char *const TAG = "gadget";
 static gadget_layout_t layout, saved_layout;
@@ -61,18 +60,6 @@ static bool package_file_exists(const char *slug, const char *filename)
     return length > 0 && (size_t)length < sizeof(path) && stat(path, &file) == 0 && S_ISREG(file.st_mode);
 }
 
-static esp_err_t show_sd_error(const char *message)
-{
-    ESP_RETURN_ON_ERROR(gadget_graphics_error(message), TAG, "Unable to display SD error");
-    for (;;) {
-        gadget_message_t message;
-        if (gadget_services_receive(&message, portMAX_DELAY) && message.kind == GADGET_MESSAGE_INPUT &&
-            message.input.action == GADGET_INPUT_EXIT) {
-            return ESP_OK;
-        }
-    }
-}
-
 static void log_focus(unsigned face)
 {
     ESP_LOGI(TAG, "Focus F%u %s (slot %u)", gadget_workspace_function_key(face), gadget_workspace_name(face), face + 1);
@@ -86,6 +73,9 @@ static TickType_t wait_until(uint64_t deadline_ms)
 
 static TickType_t wait_for_update(const gadget_dice_t *dice)
 {
+    if (gadget_graphics_blanked()) {
+        return wait_until(next_metrics_ms);
+    }
     if (dice->moving) {
         return 0;
     }
@@ -122,6 +112,14 @@ static const gadget_input_event_t *dispatch_message(const gadget_message_t *mess
     }
 
     const gadget_input_event_t *input = &message->input;
+    if (input->action == GADGET_INPUT_TOGGLE_DISPLAY) {
+        const bool waking = gadget_graphics_blanked();
+        const esp_err_t result = gadget_graphics_set_blanked(!waking);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "Display toggle failed: %s", esp_err_to_name(result));
+        }
+        return waking && result == ESP_OK ? input : NULL;
+    }
     if (input->action == GADGET_INPUT_REFRESH_WEATHER) {
         const gadget_event_t refresh = {.topic = GADGET_EVENT_WEATHER_REFRESH};
         gadget_modules_event(&refresh);
@@ -135,7 +133,28 @@ static const gadget_input_event_t *dispatch_message(const gadget_message_t *mess
         gadget_modules_event(&audio);
         return NULL;
     }
-    return input;
+    return !gadget_graphics_blanked() || input->action == GADGET_INPUT_EXIT ? input : NULL;
+}
+
+static esp_err_t show_sd_error(const char *description)
+{
+    ESP_RETURN_ON_ERROR(gadget_graphics_error(description), TAG, "Unable to display SD error");
+    for (;;) {
+        gadget_message_t message;
+        if (!gadget_services_receive(&message, portMAX_DELAY)) {
+            continue;
+        }
+        const gadget_input_event_t *input = dispatch_message(&message);
+        if (input == NULL) {
+            continue;
+        }
+        if (input->action == GADGET_INPUT_EXIT) {
+            return ESP_OK;
+        }
+        if (input->action == GADGET_INPUT_TOGGLE_DISPLAY) {
+            ESP_RETURN_ON_ERROR(gadget_graphics_error(description), TAG, "Unable to restore SD error");
+        }
+    }
 }
 
 static bool guide_selection(const gadget_input_event_t *input, unsigned *face)
@@ -203,25 +222,28 @@ static esp_err_t edit_layout(unsigned *face, bool *selected)
                 *selected = true;
                 return ESP_OK;
             }
+            if (input->action == GADGET_INPUT_TOGGLE_DISPLAY) {
+                break;
+            }
             if (input->action != GADGET_INPUT_KEY) {
                 continue;
             }
             const gadget_key_t *key = &input->key;
-            if (key->kind == GADGET_KEY_BACKSPACE) {
+            if (key->kind == GADGET_LAYOUT_BACK_KEY || key->kind == GADGET_KEY_BACKSPACE) {
                 return ESP_OK;
             }
-            if (key->kind == GADGET_KEY_ENTER) {
+            if (key->kind == GADGET_LAYOUT_SAVE_KEY || key->kind == GADGET_KEY_ENTER) {
                 if (gadget_layout_save(&draft)) {
                     saved_layout = draft;
                     view.notice = "Layout queued. Relaunch Gadget to apply.";
                 } else {
                     view.notice = "Could not queue layout save.";
                 }
-            } else if (letter(key, 's')) {
+            } else if (key->kind == GADGET_LAYOUT_MODE_KEY || letter(key, 's')) {
                 view.edit_shortcuts = !view.edit_shortcuts;
-            } else if (letter(key, 'd')) {
+            } else if (key->kind == GADGET_LAYOUT_DEFAULTS_KEY || letter(key, 'd')) {
                 gadget_layout_defaults(&draft);
-                view.notice = "Press Enter to save the defaults.";
+                view.notice = "Save to apply the defaults.";
             } else if (key->kind == GADGET_KEY_UP || key->kind == GADGET_KEY_DOWN) {
                 view.selected = (view.selected + (key->kind == GADGET_KEY_DOWN ? 1 : GADGET_FACE_COUNT - 1)) %
                                 GADGET_FACE_COUNT;
@@ -230,7 +252,7 @@ static esp_err_t edit_layout(unsigned *face, bool *selected)
                                        GADGET_FACE_COUNT;
                 swap_layout_rows(&draft, faces, view.edit_shortcuts, view.selected, other);
                 view.selected = other;
-                view.notice = "Press Enter to save the layout.";
+                view.notice = "Save to apply the layout.";
             } else {
                 continue;
             }
@@ -240,53 +262,55 @@ static esp_err_t edit_layout(unsigned *face, bool *selected)
 }
 
 // On return, face is the current or chosen workspace. GADGET_FACE_COUNT means exit to the launcher.
-static esp_err_t wait_in_guide(int64_t deadline, unsigned *face)
+static esp_err_t wait_in_guide(bool startup, unsigned *face)
 {
-    const gadget_guide_t mode = deadline != 0 ? GADGET_GUIDE_READY : GADGET_GUIDE_HELP;
+    const gadget_guide_t mode = startup ? GADGET_GUIDE_READY : GADGET_GUIDE_HELP;
     ESP_RETURN_ON_ERROR(gadget_graphics_guide(mode), TAG, "Unable to present workspace guide");
+    int64_t shown_at_us = esp_timer_get_time();
     for (;;) {
         sample_metrics();
-        TickType_t wait = wait_until(next_metrics_ms);
-        if (deadline != 0) {
-            const int64_t remaining = deadline - esp_timer_get_time();
-            const TickType_t until_continue = remaining <= 0 ? 0 :
-                                               pdMS_TO_TICKS((remaining + 999) / 1000 + portTICK_PERIOD_MS - 1);
-            if (until_continue < wait) {
-                wait = until_continue;
-            }
-        }
         gadget_message_t message;
-        if (gadget_services_receive(&message, wait)) {
-            const gadget_input_event_t *input = dispatch_message(&message);
-            if (input != NULL) {
-                if (guide_selection(input, face)) {
-                    return ESP_OK;
-                }
-                if (input->action == GADGET_INPUT_KEY) {
-                    if (input->key.kind == GADGET_KEY_ENTER) {
-                        return ESP_OK;
-                    }
-                    if (letter(&input->key, 'c')) {
-                        bool selected = false;
-                        ESP_RETURN_ON_ERROR(edit_layout(face, &selected), TAG, "Layout editor failed");
-                        if (selected) {
-                            return ESP_OK;
-                        }
-                        ESP_RETURN_ON_ERROR(gadget_graphics_guide(mode), TAG, "Unable to restore workspace guide");
-                    }
-                }
-            }
+        if (!gadget_services_receive(&message, wait_until(next_metrics_ms))) {
+            continue;
         }
-        if (deadline != 0 && esp_timer_get_time() >= deadline) {
+        const gadget_input_event_t *input = dispatch_message(&message);
+        if (input == NULL) {
+            continue;
+        }
+        if (input->action == GADGET_INPUT_TOGGLE_DISPLAY) {
+            ESP_RETURN_ON_ERROR(gadget_graphics_guide(mode), TAG, "Unable to restore workspace guide");
+            shown_at_us = esp_timer_get_time();
+            continue;
+        }
+        if ((!startup || input->action == GADGET_INPUT_EXIT) && guide_selection(input, face)) {
             return ESP_OK;
+        }
+        if (input->action != GADGET_INPUT_KEY) {
+            continue;
+        }
+        const gadget_key_t *key = &input->key;
+        if (startup) {
+            if (input->received_at_us >= shown_at_us && key->kind == GADGET_KEY_TEXT && key->modifiers == 0 &&
+                key->text[0] == ' ' && key->text[1] == '\0') {
+                return ESP_OK;
+            }
+        } else if (key->kind == GADGET_KEY_ENTER) {
+            return ESP_OK;
+        } else if (key->kind == GADGET_GUIDE_LAYOUT_KEY || letter(key, 'c')) {
+            bool selected = false;
+            ESP_RETURN_ON_ERROR(edit_layout(face, &selected), TAG, "Layout editor failed");
+            if (selected) {
+                return ESP_OK;
+            }
+            ESP_RETURN_ON_ERROR(gadget_graphics_guide(mode), TAG, "Unable to restore workspace guide");
         }
     }
 }
 
-static esp_err_t run_workspaces(int64_t guide_until)
+static esp_err_t run_workspaces(void)
 {
     unsigned first_face = 0;
-    ESP_RETURN_ON_ERROR(wait_in_guide(guide_until, &first_face), TAG, "Startup guide failed");
+    ESP_RETURN_ON_ERROR(wait_in_guide(true, &first_face), TAG, "Startup guide failed");
     if (first_face == GADGET_FACE_COUNT) {
         return ESP_OK;
     }
@@ -312,7 +336,9 @@ static esp_err_t run_workspaces(int64_t guide_until)
             if (input->action == GADGET_INPUT_EXIT) {
                 return ESP_OK;
             }
-            if (input->action == GADGET_INPUT_SELECT_FACE && input->face < GADGET_FACE_COUNT) {
+            if (input->action == GADGET_INPUT_TOGGLE_DISPLAY) {
+                dirty = true;
+            } else if (input->action == GADGET_INPUT_SELECT_FACE && input->face < GADGET_FACE_COUNT) {
                 if (gadget_dice_select(&dice, layout.shortcuts[input->face], esp_timer_get_time())) {
                     gadget_modules_focus(GADGET_FACE_COUNT);
                 }
@@ -328,6 +354,10 @@ static esp_err_t run_workspaces(int64_t guide_until)
             }
         }
 
+        if (gadget_graphics_blanked()) {
+            sample_metrics();
+            continue;
+        }
         const int64_t now = esp_timer_get_time();
         const bool settled = gadget_dice_update(&dice, now);
         if (settled) {
@@ -357,7 +387,7 @@ static esp_err_t run_workspaces(int64_t guide_until)
         if (help_requested) {
             help_requested = false;
             unsigned face = dice.active;
-            ESP_RETURN_ON_ERROR(wait_in_guide(0, &face), TAG, "Workspace guide failed");
+            ESP_RETURN_ON_ERROR(wait_in_guide(false, &face), TAG, "Workspace guide failed");
             if (face == GADGET_FACE_COUNT) {
                 return ESP_OK;
             }
@@ -371,7 +401,7 @@ static esp_err_t run_workspaces(int64_t guide_until)
     }
 }
 
-static esp_err_t start_from_sd(int64_t guide_until)
+static esp_err_t start_from_sd(void)
 {
     esp_err_t result = bsp_storage_mount_advanced(BSP_STORAGE_TYPE_SDCARD, "/sd", GADGET_MODULE_LIMIT + 4, false);
     if (result != ESP_OK) {
@@ -395,7 +425,7 @@ static esp_err_t start_from_sd(int64_t guide_until)
             gadget_graphics_prepare_workspace(face, gadget_layout_key(&layout, face) + 1, title, preview);
         }
         sample_metrics();
-        result = run_workspaces(guide_until);
+        result = run_workspaces();
         const bool modules_stopped = gadget_modules_shutdown();
         const bool settings_saved = gadget_config_stop();
         if (!modules_stopped || !settings_saved) {
@@ -425,7 +455,7 @@ static esp_err_t start(void)
     ESP_RETURN_ON_ERROR(gadget_input_init(gadget_services_input), TAG, "Unable to initialize keyboard input");
     ESP_RETURN_ON_ERROR(gadget_graphics_init(), TAG, "Unable to initialize graphics");
     ESP_RETURN_ON_ERROR(gadget_graphics_guide(GADGET_GUIDE_LOADING), TAG, "Unable to present loading guide");
-    return start_from_sd(esp_timer_get_time() + STARTUP_GUIDE_US);
+    return start_from_sd();
 }
 
 void gadget_run(void)

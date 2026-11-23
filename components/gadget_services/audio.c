@@ -19,6 +19,7 @@
 #define BYTES_PER_FRAME (2 * sizeof(int16_t))
 #define PREFILL_MS 850
 #define REPORT_INTERVAL_MS 5000
+#define OUTPUT_FAILURE_LIMIT 3
 
 static const char *const TAG = "gadget_audio";
 static StaticSemaphore_t lock_storage, joined_storage;
@@ -31,7 +32,7 @@ static const void *owner;
 static i2s_chan_handle_t channel;
 static uint32_t rate;
 static float previous_volume;
-static atomic_bool closing, playing;
+static atomic_bool closing, playing, output_failed;
 enum { ROUTE_UNKNOWN, ROUTE_SPEAKER, ROUTE_HEADPHONES };
 static atomic_uint audio_route, levels;
 static int16_t samples[2 * PCM_BLOCK_FRAMES];
@@ -59,25 +60,35 @@ bool gadget_services_audio_headphones(void)
     return atomic_load(&audio_route) == ROUTE_HEADPHONES;
 }
 
-static void write_samples(unsigned *errors)
+static bool write_samples(void)
 {
     const uint8_t *bytes = (const uint8_t *)samples;
-    for (size_t sent = 0; sent < sizeof(samples) && !atomic_load(&closing);) {
+    size_t sent = 0;
+    while (sent < sizeof(samples) && !atomic_load(&closing)) {
         size_t done = 0;
         const esp_err_t result = i2s_channel_write(channel, bytes + sent, sizeof(samples) - sent, &done, 100);
         if (result != ESP_OK || done == 0) {
-            ++*errors;
             vTaskDelay(1);
-            break;
+            return false;
         }
         sent += done;
     }
+    return sent == sizeof(samples);
+}
+
+static bool apply_route(unsigned route)
+{
+    const esp_err_t muted = bsp_audio_set_volume(0);
+    const esp_err_t disabled = bsp_audio_set_amplifier(false);
+    const esp_err_t automatic = bsp_audio_set_amplifier_force(false);
+    return muted == ESP_OK && disabled == ESP_OK && automatic == ESP_OK &&
+           (route != ROUTE_SPEAKER || bsp_audio_set_amplifier(true) == ESP_OK);
 }
 
 static void drain_pcm(void *argument)
 {
     (void)argument;
-    unsigned underruns = 0, errors = 0, min_ms = UINT_MAX;
+    unsigned underruns = 0, errors = 0, min_ms = UINT_MAX, failed_writes = 0;
     unsigned applied_volume = UINT_MAX;
     bool started = false;
     unsigned applied_route = ROUTE_UNKNOWN;
@@ -89,19 +100,20 @@ static void drain_pcm(void *argument)
         const uint64_t now = gadget_services_uptime_ms();
         const unsigned route = atomic_load(&audio_route);
         if (route != applied_route) {
-            bsp_audio_set_volume(0);
-            bsp_audio_set_amplifier(false);
-            bsp_audio_set_amplifier_force(false);
-            applied_route = route;
             applied_volume = UINT_MAX;
-            if (bsp_audio_set_amplifier(route == ROUTE_SPEAKER) != ESP_OK) {
+            if (apply_route(route)) {
+                applied_route = route;
+                if (route != ROUTE_UNKNOWN) {
+                    ESP_LOGI(TAG, "Output %s", route == ROUTE_HEADPHONES ? "headphones" : "speaker");
+                }
+            } else {
+                applied_route = ROUTE_UNKNOWN;
                 ++errors;
             }
-            ESP_LOGI(TAG, "Output %s", route == ROUTE_HEADPHONES ? "headphones" : "speaker");
         }
         const unsigned pair = atomic_load(&levels);
         const unsigned requested = route == ROUTE_HEADPHONES ? pair >> 8 : pair & 0xff;
-        if (route != ROUTE_UNKNOWN && requested != applied_volume) {
+        if (route != ROUTE_UNKNOWN && route == applied_route && requested != applied_volume) {
             if (bsp_audio_set_volume((float)requested) == ESP_OK) {
                 applied_volume = requested;
             } else {
@@ -117,10 +129,11 @@ static void drain_pcm(void *argument)
         if (started && available < sizeof(samples)) {
             ++underruns;
             started = false;
-            atomic_store(&playing, false);
-        } else if (!started && available >= threshold && route != ROUTE_UNKNOWN) {
+        }
+        if (route == ROUTE_UNKNOWN || route != applied_route || requested != applied_volume) {
+            started = false;
+        } else if (!started && available >= threshold) {
             started = true;
-            atomic_store(&playing, true);
             min_ms = buffered_ms;
         }
         if (started) {
@@ -131,7 +144,16 @@ static void drain_pcm(void *argument)
         } else {
             memset(samples, 0, sizeof(samples));
         }
-        write_samples(&errors);
+        const bool written = write_samples();
+        if (written) {
+            failed_writes = 0;
+        } else if (!atomic_load(&closing)) {
+            ++errors;
+            if (++failed_writes >= OUTPUT_FAILURE_LIMIT) {
+                atomic_store(&output_failed, true);
+            }
+        }
+        atomic_store(&playing, started && written && !atomic_load(&output_failed));
 
         if (now >= report_at) {
             ESP_LOGI(TAG, "PCM %lu Hz, level %ums, low %ums, underruns %u, output errors %u",
@@ -145,6 +167,41 @@ static void drain_pcm(void *argument)
     vTaskSuspend(NULL);
 }
 
+static bool silence_dma(i2s_chan_handle_t device, size_t dma_bytes)
+{
+    // The BSP uses circular DMA buffers. Cover the whole ring and clock those samples out.
+    memset(samples, 0, sizeof(samples));
+    for (size_t left = 2 * dma_bytes; left != 0;) {
+        const size_t size = left < sizeof(samples) ? left : sizeof(samples);
+        size_t written = 0;
+        if (i2s_channel_write(device, samples, size, &written, 100) != ESP_OK || written != size) {
+            return false;
+        }
+        left -= size;
+    }
+    return dma_bytes != 0;
+}
+
+static void close_buffered_output(i2s_chan_handle_t device)
+{
+    bsp_audio_set_volume(0);
+    bsp_audio_set_amplifier(false);
+    bsp_audio_set_amplifier_force(false);
+    i2s_chan_info_t info;
+    if (i2s_channel_get_info(device, &info) == ESP_OK) {
+        if (!info.is_enabled) {
+            bsp_audio_set_volume(previous_volume);
+            return;
+        }
+        const bool silent = silence_dma(device, info.total_dma_buf_size);
+        if (i2s_channel_disable(device) == ESP_OK || silent) {
+            bsp_audio_set_volume(previous_volume);
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "Could not silence and stop I2S");
+}
+
 static bool open_audio(const void *requester, uint32_t sample_rate, bool buffered, unsigned initial_volume)
 {
     if (sample_rate < 8000 || sample_rate > 48000 ||
@@ -153,35 +210,36 @@ static bool open_audio(const void *requester, uint32_t sample_rate, bool buffere
     }
     bool opened = false;
     i2s_chan_handle_t device = NULL;
-    if (owner == NULL && bsp_audio_get_i2s_handle(&device) == ESP_OK && device != NULL) {
+    i2s_chan_info_t info;
+    if (owner == NULL && bsp_audio_get_i2s_handle(&device) == ESP_OK && device != NULL &&
+        i2s_channel_get_info(device, &info) == ESP_OK) {
+        bool muted = true;
         if (buffered) {
             previous_volume = 50;
             bsp_audio_get_volume(&previous_volume);
             bsp_audio_set_amplifier(false);
-            bsp_audio_set_volume(0);
+            muted = bsp_audio_set_volume(0) == ESP_OK;
         }
-        if (i2s_channel_disable(device) == ESP_OK) {
-            const esp_err_t configured = bsp_audio_set_rate(sample_rate);
-            const esp_err_t enabled = i2s_channel_enable(device);
-            if (configured == ESP_OK && enabled == ESP_OK) {
-                if (!buffered) {
-                    opened = bsp_audio_set_amplifier(true) == ESP_OK;
-                } else {
-                    queue_memory = heap_caps_malloc(PCM_BUFFER_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    if (queue_memory != NULL) {
-                        queue = xStreamBufferCreateStatic(PCM_BUFFER_BYTES + 1, 1, queue_memory, &queue_storage);
-                        channel = device;
-                        rate = sample_rate;
-                        atomic_store(&levels, pack_levels(initial_volume, initial_volume));
-                        atomic_store(&closing, false);
-                        opened = queue != NULL &&
-                                 xTaskCreate(drain_pcm, "gadget_pcm", 4608, NULL, 6, &drain_task) == pdPASS;
-                        if (!opened) {
-                            queue = NULL;
-                            heap_caps_free(queue_memory);
-                            queue_memory = NULL;
-                            channel = NULL;
-                        }
+        if (muted && (!info.is_enabled || i2s_channel_disable(device) == ESP_OK) &&
+            bsp_audio_set_rate(sample_rate) == ESP_OK && i2s_channel_enable(device) == ESP_OK) {
+            if (!buffered) {
+                opened = bsp_audio_set_amplifier(true) == ESP_OK;
+            } else if (silence_dma(device, info.total_dma_buf_size)) {
+                queue_memory = heap_caps_malloc(PCM_BUFFER_BYTES + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (queue_memory != NULL) {
+                    queue = xStreamBufferCreateStatic(PCM_BUFFER_BYTES + 1, 1, queue_memory, &queue_storage);
+                    channel = device;
+                    rate = sample_rate;
+                    atomic_store(&levels, pack_levels(initial_volume, initial_volume));
+                    atomic_store(&closing, false);
+                    atomic_store(&output_failed, false);
+                    opened = queue != NULL &&
+                             xTaskCreate(drain_pcm, "gadget_pcm", 4608, NULL, 6, &drain_task) == pdPASS;
+                    if (!opened) {
+                        queue = NULL;
+                        heap_caps_free(queue_memory);
+                        queue_memory = NULL;
+                        channel = NULL;
                     }
                 }
             }
@@ -191,7 +249,7 @@ static bool open_audio(const void *requester, uint32_t sample_rate, bool buffere
             channel = device;
             writer = xTaskGetCurrentTaskHandle();
         } else if (buffered) {
-            bsp_audio_set_volume(previous_volume);
+            close_buffered_output(device);
         }
     }
     xSemaphoreGive(lock);
@@ -265,11 +323,13 @@ int gadget_services_audio_write(const void *requester, const int16_t *stereo, si
     int result = -1;
     if (owner == requester && writer == xTaskGetCurrentTaskHandle()) {
         if (queue != NULL) {
-            // Keep queue operations aligned to whole stereo frames.
-            const size_t space = xStreamBufferSpacesAvailable(queue) / BYTES_PER_FRAME;
-            const size_t accepted = frames < space ? frames : space;
-            result = accepted == 0 ? 0 :
-                     (int)(xStreamBufferSend(queue, stereo, accepted * BYTES_PER_FRAME, 0) / BYTES_PER_FRAME);
+            if (!atomic_load(&output_failed)) {
+                // Keep queue operations aligned to whole stereo frames.
+                const size_t space = xStreamBufferSpacesAvailable(queue) / BYTES_PER_FRAME;
+                const size_t accepted = frames < space ? frames : space;
+                result = accepted == 0 ? 0 :
+                         (int)(xStreamBufferSend(queue, stereo, accepted * BYTES_PER_FRAME, 0) / BYTES_PER_FRAME);
+            }
         } else {
             size_t sent = 0;
             const esp_err_t wrote = i2s_channel_write(channel, stereo, frames * BYTES_PER_FRAME, &sent, 100);
@@ -295,9 +355,7 @@ void gadget_services_audio_close(const void *requester)
             queue = NULL;
             heap_caps_free(queue_memory);
             queue_memory = NULL;
-            bsp_audio_set_volume(0);
-            bsp_audio_set_amplifier(false);
-            bsp_audio_set_volume(previous_volume);
+            close_buffered_output(channel);
         } else {
             bsp_audio_set_amplifier(false);
         }

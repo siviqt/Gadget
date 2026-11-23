@@ -7,5 +7,5 @@ idf_component_register(SRCS "display.c" "workspaces.c" "reel.c" "guide.c" "fonts
                             "${fonts}/ibm_plex_mono_semibold_56.c"
                        INCLUDE_DIRS "include"
                        REQUIRES gadget_dice gadget_sdk
-                       PRIV_REQUIRES badgeteam__badge-bsp robotman2412__pax-gfx
+                       PRIV_REQUIRES badgeteam__badge-bsp robotman2412__pax-gfx nicolaielectronics__tanmatsu_coprocessor
                                      esp_driver_ppa esp_lcd esp_timer freertos heap)

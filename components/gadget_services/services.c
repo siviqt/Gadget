@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "bsp/power.h"
@@ -24,9 +25,11 @@
 #define MESSAGE_COUNT 32
 #define IO_TIMEOUT_MS 1500
 #define WIFI_ATTEMPT_MS 8000
+#define ICY_INTERVAL_LIMIT (16u * 1024 * 1024)
 
 struct gadget_http_stream {
     esp_http_client_handle_t client;
+    uint32_t icy_interval;
 };
 
 static QueueHandle_t inbox;
@@ -262,10 +265,41 @@ int gadget_services_dns_query(const void *query, size_t length, void *reply, siz
     return -1;
 }
 
-gadget_http_stream_t *gadget_services_http_open(const char *url, int *status, const atomic_bool *stopping)
+static esp_err_t read_icy_interval(esp_http_client_event_t *event)
+{
+    if (event->event_id != HTTP_EVENT_ON_HEADER || event->header_key == NULL || event->header_value == NULL ||
+        strcasecmp(event->header_key, "icy-metaint") != 0) {
+        return ESP_OK;
+    }
+    gadget_http_stream_t *stream = event->user_data;
+    const char *value = event->header_value;
+    while (*value == ' ' || *value == '\t') {
+        ++value;
+    }
+    uint32_t interval = 0;
+    while (*value >= '0' && *value <= '9' && interval <= ICY_INTERVAL_LIMIT) {
+        interval = interval * 10 + (uint32_t)(*value++ - '0');
+    }
+    while (*value == ' ' || *value == '\t') {
+        ++value;
+    }
+    if (*value != '\0' || interval == 0 || interval > ICY_INTERVAL_LIMIT ||
+        (stream->icy_interval != 0 && stream->icy_interval != interval)) {
+        stream->icy_interval = UINT32_MAX;
+    } else {
+        stream->icy_interval = interval;
+    }
+    return ESP_OK;
+}
+
+static gadget_http_stream_t *open_http(const char *url, int *status, uint32_t *interval, bool request_metadata,
+                                       const atomic_bool *stopping)
 {
     if (status != NULL) {
         *status = 0;
+    }
+    if (interval != NULL) {
+        *interval = 0;
     }
     if (url == NULL || atomic_load(stopping)) {
         return NULL;
@@ -285,14 +319,28 @@ gadget_http_stream_t *gadget_services_http_open(const char *url, int *status, co
         .crt_bundle_attach = esp_crt_bundle_attach,
         .user_agent = "Gadget/0.3",
         .disable_auto_redirect = true,
+        .event_handler = interval != NULL ? read_icy_interval : NULL,
+        .user_data = stream,
     };
     stream->client = esp_http_client_init(&config);
+    if (request_metadata && stream->client != NULL &&
+        esp_http_client_set_header(stream->client, "Icy-MetaData", "1") != ESP_OK) {
+        gadget_services_http_close(stream);
+        return NULL;
+    }
     for (unsigned redirects = 0; stream->client != NULL && redirects <= 3 && !atomic_load(stopping); ++redirects) {
+        stream->icy_interval = 0;
         if (esp_http_client_open(stream->client, 0) != ESP_OK || esp_http_client_fetch_headers(stream->client) < 0) {
             break;
         }
         const int code = esp_http_client_get_status_code(stream->client);
         if (code != 301 && code != 302 && code != 303 && code != 307 && code != 308) {
+            if (interval != NULL && code == 200) {
+                *interval = stream->icy_interval;
+                if (*interval == UINT32_MAX) {
+                    break;
+                }
+            }
             if (status != NULL) {
                 *status = code;
             }
@@ -309,6 +357,29 @@ gadget_http_stream_t *gadget_services_http_open(const char *url, int *status, co
     }
     gadget_services_http_close(stream);
     return NULL;
+}
+
+gadget_http_stream_t *gadget_services_http_open(const char *url, int *status, const atomic_bool *stopping)
+{
+    return open_http(url, status, NULL, false, stopping);
+}
+
+gadget_http_stream_t *gadget_services_http_open_icy(const char *url, int *status, uint32_t *interval,
+                                                   const atomic_bool *stopping)
+{
+    if (interval == NULL) {
+        return gadget_services_http_open(url, status, stopping);
+    }
+    int code;
+    gadget_http_stream_t *stream = open_http(url, &code, interval, true, stopping);
+    if (*interval == UINT32_MAX || code == 400 || code == 406) {
+        gadget_services_http_close(stream);
+        stream = open_http(url, &code, interval, false, stopping);
+    }
+    if (status != NULL) {
+        *status = code;
+    }
+    return stream;
 }
 
 int gadget_services_http_read(gadget_http_stream_t *stream, void *buffer, size_t size)
