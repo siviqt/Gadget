@@ -13,6 +13,7 @@ void gadget_modules_start(const char *root, const gadget_layout_t *layout);
 bool gadget_modules_shutdown(void);
 void gadget_modules_preview_layout(const gadget_layout_t *layout, gadget_face_assignment_t faces[GADGET_FACE_COUNT]);
 void gadget_modules_measure_stacks(void);
+void gadget_modules_system_sample(void);
 const char *gadget_modules_title(unsigned face);
 bool gadget_modules_startup_preview(unsigned face);
 void gadget_modules_focus(unsigned face);

@@ -52,7 +52,7 @@ Replace the corresponding installed example folders when testing rebuilt copies 
 - `init` runs once on the main runtime task. `shutdown` releases resources after normal exit or a failed `init`.
 - `activate` and `deactivate` follow workspace focus. `input` receives normalized navigation and UTF-8 text events while the face is focused. Gadget handles its global workspace shortcuts and the double `Esc` exit gesture.
 - The focused face can handle bare `F1`–`F6` and `Tab` navigation events. The Hyper chords and the two-second Hyper latch still select workspaces.
-- Include `gadget_keycap.h` to draw an `F1`–`F6` keycap using the same `GADGET_KEY_F*` value as the input binding.
+- Include `gadget_keycap.h` and pass the same `GADGET_KEY_F*` value to `gadget_draw_function_key` as the input binding. The helper draws the matching color and shape using `canvas->rect`. Use `GADGET_KEYCAP_OPAQUE` for an available action and `GADGET_KEYCAP_DIMMED` for an unavailable one. Rebuild the module ELF to pick up the new legends.
 - `update` runs on the active face at the manifest's requested interval. Call `invalidate` to request a redraw. `render` borrows a clipped canvas with panel-relative coordinates and rectangle and text drawing callbacks. Use `canvas->width` and `canvas->height` for layout. Canvas handles are valid until `render` returns.
 - `service_start` runs after initialization. `worker` is optional and runs on a separate task regardless of workspace focus. A worker blocks or paces itself through `wait_for_stop`. Gadget signals workers and joins them before `service_stop` and `shutdown`.
 - `publish` copies the sender ID, topic and integer value into a bounded queue. It returns `false` if the queue is full or the sender is stopping. `event` callbacks run on the runtime task, including for inactive faces. Store data there and let Gadget redraw the active face.
@@ -101,3 +101,5 @@ Gadget 0.5.1 adds optional checked file writes and ICY requests to SDK v1.
 - `http_open_icy` is an optional alternative to `http_open` for a network worker that can handle ICY framing. The call requests stream metadata and returns the number of audio bytes between metadata blocks. An interval of zero indicates unframed audio.
 
 Gadget 0.6.0 appends the optional `battery_status` callback. Check it with `GADGET_HOST_HAS` and call it from a runtime callback. A successful call returns the cached battery presence, estimated charge percentage, charging state and external power state. The runtime reads the battery about every 15 seconds.
+
+SD revision 12 adds two optional SDK v1 entries. `system_details` copies heap capacities and the cached Wi-Fi identity, addresses and signal strength. The focused module receives `GADGET_EVENT_SYSTEM_SAMPLE` after the shared five-second sample. The `aac` table decodes complete ADTS frames to 16-bit PCM. Open, decode and close each handle on the same worker. Check both entries with `GADGET_HOST_HAS`.

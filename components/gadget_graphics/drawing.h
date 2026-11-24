@@ -13,6 +13,11 @@ static inline uint16_t gadget_rgb565(uint32_t color)
     return (uint16_t)(((color >> 8) & 0xf800) | ((color >> 5) & 0x07e0) | ((color >> 3) & 0x001f));
 }
 
+static inline void gadget_pax_rect(void *surface, int x, int y, int w, int h, uint32_t color)
+{
+    pax_draw_rect(surface, color, x, y, w, h);
+}
+
 void gadget_text(pax_buf_t *surface, uint32_t color, unsigned pixels, int x, int y, const char *text);
 bool gadget_text_bounds(unsigned pixels, const char *text, gadget_text_bounds_t *bounds);
 void gadget_draw_set_workspace(unsigned face, unsigned function_key, const char *title);

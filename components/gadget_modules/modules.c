@@ -53,6 +53,7 @@ struct module_instance {
     bool registering_workers;
     atomic_bool stopping;
     bool redraw;
+    bool reads_system_details;
     gadget_damage_t damage;
     portMUX_TYPE shared_lock;
     uint64_t next_update;
@@ -511,6 +512,17 @@ static bool host_system_service(gadget_module_context_t *context, unsigned index
     return false;
 }
 
+static bool host_system_details(gadget_module_context_t *context, gadget_system_details_t *details)
+{
+    module_instance_t *module = (module_instance_t *)context;
+    if (details == NULL || current_worker(module) != NULL) {
+        return false;
+    }
+    module->reads_system_details = true;
+    gadget_services_system_details(details);
+    return true;
+}
+
 static bool host_battery_status(gadget_module_context_t *context, gadget_battery_status_t *status)
 {
     return status != NULL && current_worker((module_instance_t *)context) == NULL &&
@@ -562,6 +574,8 @@ static const gadget_host_t host = {
     .state_write_status = host_state_write_status,
     .http_open_icy = host_http_open_icy,
     .battery_status = host_battery_status,
+    .system_details = host_system_details,
+    .aac = &gadget_aac_api,
 };
 
 static void run_worker(void *argument)
@@ -946,8 +960,23 @@ bool gadget_modules_input(unsigned face, const gadget_key_t *key)
     return true;
 }
 
+void gadget_modules_system_sample(void)
+{
+    if (focused != NULL && focused->reads_system_details && focused->hooks->event != NULL &&
+        !gadget_services_request_network_sample()) {
+        const gadget_event_t event = {.topic = GADGET_EVENT_SYSTEM_SAMPLE};
+        focused->hooks->event(&focused->context, &event);
+    }
+}
+
 void gadget_modules_event(const gadget_event_t *event)
 {
+    if (event->sender[0] == '\0' && event->topic == GADGET_EVENT_SYSTEM_SAMPLE) {
+        if (focused != NULL && focused->reads_system_details && focused->hooks->event != NULL) {
+            focused->hooks->event(&focused->context, event);
+        }
+        return;
+    }
     if (event->sender[0] != '\0') {
         const module_instance_t *source = find_module(event->sender);
         if (source == NULL || source->status != RUNNING) {

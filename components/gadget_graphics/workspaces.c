@@ -1,10 +1,5 @@
 #include "drawing.h"
-
-#include <stdio.h>
-
-static const pax_col_t accents[GADGET_FACE_COUNT] = {
-    0xff6ed9ed, 0xffedb664, 0xffe7a8dc, 0xff7ee0ad, 0xffa8bdfd, 0xfff1a096,
-};
+#include "gadget_keycap.h"
 
 #define WORKSPACE_COLOR 0xff1c2938u
 
@@ -177,16 +172,21 @@ void gadget_draw_workspace_damage(pax_buf_t *surface, unsigned face, gadget_work
     *end_row = clip.bottom;
 }
 
+static void draw_workspace_key(pax_buf_t *surface, int x, int y, unsigned face)
+{
+    const gadget_canvas_t canvas = {.handle = surface, .rect = gadget_pax_rect};
+    const gadget_key_kind_t key = GADGET_KEY_F1 + gadget_workspace_function_key(face) - 1;
+    gadget_draw_function_symbol(&canvas, x, y, key, GADGET_KEYCAP_OPAQUE);
+}
+
 void gadget_draw_workspace(pax_buf_t *surface, unsigned face, bool received_input, gadget_workspace_draw_t draw)
 {
     pax_background(surface, WORKSPACE_COLOR);
     if (draw != NULL) {
         draw_content(surface, face, draw, (gadget_damage_t){0});
     } else {
-        char label[8];
-        snprintf(label, sizeof(label), "F%u", gadget_workspace_function_key(face));
         const int middle = pax_buf_get_height(surface) / 2;
-        gadget_text(surface, accents[face], 20, 28, middle - 65, label);
+        draw_workspace_key(surface, 28, middle - 65, face);
         gadget_text(surface, GADGET_TEXT, 24, 28, middle - 28, "Empty workspace");
         if (received_input) {
             gadget_text(surface, GADGET_MUTED, 18, 28, middle + 16, "Workspace input received");
@@ -198,10 +198,8 @@ void gadget_draw_workspace(pax_buf_t *surface, unsigned face, bool received_inpu
 void gadget_draw_preview(pax_buf_t *surface, unsigned face)
 {
     pax_background(surface, WORKSPACE_COLOR);
-    char label[8];
-    snprintf(label, sizeof(label), "F%u", gadget_workspace_function_key(face));
     const int middle = surface->height / 2;
-    gadget_text(surface, accents[face], 12, 14, middle - 33, label);
+    draw_workspace_key(surface, 14, middle - 34, face);
     gadget_text(surface, GADGET_TEXT, 14, 14, middle - 14, gadget_workspace_name(face));
     pax_join();
 }

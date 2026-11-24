@@ -6,10 +6,11 @@
 #include <string.h>
 
 #define RESPONSE_BYTES 8192
-#define PAGE_LIMIT 5000
+#define LOOKAHEAD_BATCHES 3u
 
 typedef struct {
-    unsigned serial, offset;
+    unsigned serial;
+    radio_directory_cursor_t cursor;
     radio_directory_mode_t mode;
     char query[RADIO_QUERY_BYTES];
 } directory_request_t;
@@ -19,19 +20,26 @@ typedef struct {
     radio_directory_page_t page;
 } directory_response_t;
 
+typedef struct {
+    radio_station_t rows[LOOKAHEAD_BATCHES * RADIO_PAGE_ROWS];
+    char query[RADIO_QUERY_BYTES];
+    radio_directory_mode_t mode;
+    unsigned offset, next_offset, count;
+    bool valid, more;
+} directory_window_t;
+
 _Static_assert(sizeof(directory_response_t) <= GADGET_SHARED_COPY_LIMIT, "Radio directory page is too large");
 
 static directory_request_t request;
 static directory_response_t response, incoming;
+static directory_window_t window;
 static atomic_uint requested;
 static char body[RESPONSE_BYTES + 1];
 
 void radio_directory_request(gadget_module_context_t *module, const char *query, radio_directory_mode_t mode,
-                             unsigned offset)
+                             radio_directory_cursor_t cursor)
 {
-    directory_request_t next = {
-        .serial = request.serial + 1, .offset = offset < PAGE_LIMIT ? offset : PAGE_LIMIT, .mode = mode,
-    };
+    directory_request_t next = {.serial = request.serial + 1, .cursor = cursor, .mode = mode};
     if (query != NULL) {
         memcpy(next.query, query, radio_text_length(query, sizeof(next.query) - 1));
     }
@@ -47,7 +55,7 @@ void radio_directory_page(gadget_module_context_t *module, radio_directory_page_
     if (request.serial == snapshot.serial) {
         *page = snapshot.page;
     } else {
-        *page = (radio_directory_page_t){.offset = request.offset, .status = DIRECTORY_LOADING};
+        *page = (radio_directory_page_t){.cursor = request.cursor, .status = DIRECTORY_LOADING};
     }
 }
 
@@ -79,7 +87,7 @@ static bool ascii_letter(char ch)
 }
 
 static gadget_json_t *fetch_page(gadget_module_context_t *module, const char *host,
-                                 const directory_request_t *job)
+                                 const directory_request_t *job, unsigned offset)
 {
     char encoded[3 * RADIO_QUERY_BYTES];
     char url[384];
@@ -97,8 +105,8 @@ static gadget_json_t *fetch_page(gadget_module_context_t *module, const char *ho
         }
     }
     module->host->format(url, sizeof(url),
-                         "https://%s/json/stations/search?%s=%s&codec=MP3&hidebroken=true&order=name&limit=%u&offset=%u",
-                         host, field, encoded, RADIO_PAGE_ROWS, job->offset);
+                         "https://%s/json/stations/search?%s=%s&hidebroken=true&order=name&limit=%u&offset=%u",
+                         host, field, encoded, (unsigned)RADIO_PAGE_ROWS, offset);
     int status = 0;
     gadget_http_stream_t *stream = module->host->http_open(module, url, &status);
     if (stream == NULL) {
@@ -131,12 +139,12 @@ static gadget_json_t *fetch_page(gadget_module_context_t *module, const char *ho
     return body[start] == '[' ? module->host->json->parse(body, used) : NULL;
 }
 
-static void copy_station_name(char out[RADIO_NAME_BYTES], const char *name)
+static void copy_label(char *out, size_t capacity, const char *name)
 {
     while (*name != '\0' && (unsigned char)*name <= ' ') {
         ++name;
     }
-    size_t size = radio_text_length(name, RADIO_NAME_BYTES - 1);
+    size_t size = radio_text_length(name, capacity - 1);
     while (size != 0 && ((unsigned char)name[size] & 0xc0) == 0x80) {
         --size;
     }
@@ -150,50 +158,112 @@ static void copy_station_name(char out[RADIO_NAME_BYTES], const char *name)
     out[size] = '\0';
 }
 
-static void parse_stations(const gadget_json_api_t *json, const gadget_json_t *document, radio_directory_page_t *page)
+static bool parse_station(const gadget_json_api_t *json, const gadget_json_t *item, bool aac_available,
+                          radio_station_t *row)
 {
-    unsigned raw = 0;
-    for (; raw < RADIO_PAGE_ROWS; ++raw) {
-        const gadget_json_t *item = json->at(document, raw);
-        if (item == NULL) {
-            break;
-        }
-        const char *name = json->string(json->member(item, "name"));
-        const char *codec = json->string(json->member(item, "codec"));
-        const char *url = json->string(json->member(item, "url_resolved"));
-        float hls;
-        if (json->number(json->member(item, "hls"), &hls) && hls != 0) {
-            continue;
-        }
-        if (!radio_http_url(url)) {
-            url = json->string(json->member(item, "url"));
-        }
-        if (name == NULL || name[0] == '\0' || codec == NULL || radio_text_length(codec, 4) != 3 ||
-            memcmp(codec, "MP3", 3) != 0 || !radio_http_url(url)) {
-            continue;
-        }
-        radio_station_t *row = &page->rows[page->count];
-        copy_station_name(row->name, name);
-        if (row->name[0] == '\0') {
-            continue;
-        }
-        ++page->count;
-        memcpy(row->url, url, radio_text_length(url, sizeof(row->url) - 1) + 1);
-        const char *uuid = json->string(json->member(item, "stationuuid"));
-        if (radio_uuid_valid(uuid)) {
-            memcpy(row->uuid, uuid, sizeof(row->uuid));
-        }
-        const char *country = json->string(json->member(item, "countrycode"));
-        if (country != NULL && radio_text_length(country, 3) == 2 &&
-            country[0] >= 'A' && country[0] <= 'Z' && country[1] >= 'A' && country[1] <= 'Z') {
-            memcpy(row->country, country, sizeof(row->country));
-        }
-        float rate;
-        if (json->number(json->member(item, "bitrate"), &rate) && rate >= 0 && rate <= 10000) {
-            row->bitrate = (uint16_t)rate;
+    const char *name = json->string(json->member(item, "name"));
+    const char *reported_codec = json->string(json->member(item, "codec"));
+    const radio_codec_t codec = radio_codec_from_name(reported_codec);
+    float hls_flag;
+    const bool hls = json->number(json->member(item, "hls"), &hls_flag) && hls_flag != 0;
+    if (name == NULL || (!hls && (codec == RADIO_CODEC_AUTO || (codec != RADIO_CODEC_MP3 && !aac_available)))) {
+        return false;
+    }
+    const char *url = json->string(json->member(item, "url_resolved"));
+    if (!radio_station_url_valid(url)) {
+        url = json->string(json->member(item, "url"));
+        if (!radio_station_url_valid(url)) {
+            return false;
         }
     }
-    page->more = raw == RADIO_PAGE_ROWS && page->offset < PAGE_LIMIT;
+    *row = (radio_station_t){.codec = codec, .hls = hls};
+    copy_label(row->name, sizeof(row->name), name);
+    if (row->name[0] == '\0') {
+        return false;
+    }
+    if (hls && codec == RADIO_CODEC_AUTO && reported_codec != NULL) {
+        copy_label(row->reported_codec, sizeof(row->reported_codec), reported_codec);
+        if (memcmp(row->reported_codec, "UNKNOWN", sizeof("UNKNOWN")) == 0) {
+            row->reported_codec[0] = '\0';
+        }
+    }
+    memcpy(row->url, url, radio_text_length(url, sizeof(row->url) - 1) + 1);
+    const char *uuid = json->string(json->member(item, "stationuuid"));
+    if (radio_uuid_valid(uuid)) {
+        memcpy(row->uuid, uuid, sizeof(row->uuid));
+    }
+    const char *country = json->string(json->member(item, "countrycode"));
+    if (country != NULL && radio_text_length(country, 3) == 2 &&
+        country[0] >= 'A' && country[0] <= 'Z' && country[1] >= 'A' && country[1] <= 'Z') {
+        memcpy(row->country, country, sizeof(row->country));
+    }
+    float rate;
+    if (json->number(json->member(item, "bitrate"), &rate) && rate >= 0 && rate <= 10000) {
+        row->bitrate = (uint16_t)rate;
+    }
+    return true;
+}
+
+static bool load_window(gadget_module_context_t *module, const char *host, const directory_request_t *job)
+{
+    const gadget_json_api_t *json = module->host->json;
+    const bool aac_available = GADGET_HOST_HAS(module->host, aac);
+    window.valid = false;
+    window.count = 0;
+    window.next_offset = job->cursor.offset;
+    for (unsigned batch = 0; batch < LOOKAHEAD_BATCHES && !cancelled(module, job->serial); ++batch) {
+        gadget_json_t *document = fetch_page(module, host, job, window.next_offset);
+        if (document == NULL) {
+            // A failed lookahead can leave an earlier batch available to browse.
+            break;
+        }
+        bool playable = false;
+        unsigned raw = 0;
+        for (; raw < RADIO_PAGE_ROWS; ++raw) {
+            const gadget_json_t *item = json->at(document, raw);
+            if (item == NULL) {
+                break;
+            }
+            radio_station_t *row = &window.rows[window.count];
+            if (parse_station(json, item, aac_available, row)) {
+                ++window.count;
+                playable |= !row->hls;
+            }
+        }
+        json->destroy(document);
+        window.valid = true;
+        window.next_offset += raw;
+        window.more = raw == RADIO_PAGE_ROWS && window.next_offset <= RADIO_DIRECTORY_LAST_OFFSET;
+        if (playable || !window.more) {
+            break;
+        }
+    }
+    window.offset = job->cursor.offset;
+    window.mode = job->mode;
+    memcpy(window.query, job->query, sizeof(window.query));
+    return window.valid;
+}
+
+static void read_window_page(radio_directory_page_t *page)
+{
+    // Keep discovery order within each group and put playable rows first.
+    unsigned position = 0;
+    for (unsigned hls = 0; hls < 2 && page->count < RADIO_PAGE_ROWS; ++hls) {
+        for (unsigned i = 0; i < window.count && page->count < RADIO_PAGE_ROWS; ++i) {
+            const radio_station_t *row = &window.rows[i];
+            if (row->hls == hls && position++ >= page->cursor.row) {
+                page->rows[page->count++] = *row;
+            }
+        }
+    }
+    const unsigned next_row = page->cursor.row + page->count;
+    if (next_row < window.count) {
+        page->next = (radio_directory_cursor_t){.offset = page->cursor.offset, .row = next_row};
+        page->more = true;
+    } else {
+        page->next = (radio_directory_cursor_t){.offset = window.next_offset};
+        page->more = window.more;
+    }
     page->status = DIRECTORY_RESULTS;
 }
 
@@ -218,7 +288,7 @@ void radio_directory_worker(gadget_module_context_t *module)
             continue;
         }
         incoming = (directory_response_t){.serial = serial,
-                                         .page = {.offset = job.offset, .status = DIRECTORY_ERROR}};
+                                         .page = {.cursor = job.cursor, .status = DIRECTORY_ERROR}};
         const uint64_t now = module->host->uptime_ms();
         if (now >= expires) {
             mirror_count = radio_find_directory_hosts(module, mirrors);
@@ -232,14 +302,17 @@ void radio_directory_worker(gadget_module_context_t *module)
             }
             last_mirror = 0;
         }
-        for (unsigned attempt = 0; attempt < mirror_count && !cancelled(module, serial); ++attempt) {
-            const unsigned mirror = (last_mirror + attempt) % mirror_count;
-            gadget_json_t *document = fetch_page(module, mirrors[mirror], &job);
-            if (document != NULL) {
-                parse_stations(module->host->json, document, &incoming.page);
-                module->host->json->destroy(document);
-                last_mirror = mirror;
-                break;
+        if (job.cursor.row != 0 && window.valid && job.cursor.offset == window.offset &&
+            job.mode == window.mode && memcmp(job.query, window.query, sizeof(job.query)) == 0) {
+            read_window_page(&incoming.page);
+        } else {
+            for (unsigned attempt = 0; attempt < mirror_count && !cancelled(module, serial); ++attempt) {
+                const unsigned mirror = (last_mirror + attempt) % mirror_count;
+                if (load_window(module, mirrors[mirror], &job)) {
+                    read_window_page(&incoming.page);
+                    last_mirror = mirror;
+                    break;
+                }
             }
         }
         if (!cancelled(module, serial)) {

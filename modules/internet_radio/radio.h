@@ -6,18 +6,31 @@
 #define RADIO_URL_BYTES 513
 #define RADIO_UUID_BYTES 37
 #define RADIO_PAGE_ROWS 4
+#define RADIO_DIRECTORY_LAST_OFFSET 5000u
 #define RADIO_QUERY_BYTES 56
 #define RADIO_TITLE_BYTES 160
 #define DIRECTORY_MIRRORS 3
 #define DIRECTORY_HOST_BYTES 64
+
+typedef enum {
+    RADIO_CODEC_AUTO, RADIO_CODEC_MP3, RADIO_CODEC_AAC, RADIO_CODEC_AAC_PLUS, RADIO_CODEC_HE_AAC_V2,
+} radio_codec_t;
 
 typedef struct {
     char name[RADIO_NAME_BYTES];
     char url[RADIO_URL_BYTES];
     char uuid[RADIO_UUID_BYTES];
     char country[3];
+    char reported_codec[16];
     uint16_t bitrate;
+    uint8_t codec;
+    bool hls;
 } radio_station_t;
+
+typedef struct {
+    radio_codec_t codec;
+    unsigned bitrate;
+} radio_stream_info_t;
 
 typedef enum {
     RADIO_SAVE_PENDING, RADIO_SAVE_QUEUED, RADIO_DUPLICATE, RADIO_SAVE_FAILED,
@@ -35,7 +48,11 @@ typedef enum {
 typedef enum { DIRECTORY_NAME, DIRECTORY_COUNTRY } radio_directory_mode_t;
 
 typedef struct {
-    unsigned offset;
+    uint16_t offset, row;
+} radio_directory_cursor_t;
+
+typedef struct {
+    radio_directory_cursor_t cursor, next;
     unsigned count;
     bool more;
     directory_status_t status;
@@ -45,13 +62,18 @@ typedef struct {
 void radio_network_worker(gadget_module_context_t *module);
 void radio_decode_worker(gadget_module_context_t *module);
 void radio_directory_worker(gadget_module_context_t *module);
+unsigned radio_adts_frame_bytes(const uint8_t *data, unsigned size);
+unsigned radio_adts_sync(const uint8_t *data, unsigned size);
 
 void radio_tune(gadget_module_context_t *module, const char *url);
 void radio_set_levels(unsigned speaker, unsigned headphones, bool muted);
 radio_playback_t radio_playback(void);
+radio_stream_info_t radio_stream_info(gadget_module_context_t *module);
+radio_codec_t radio_codec_from_name(const char *name);
+const char *radio_codec_name(radio_codec_t codec);
 void radio_stream_title(gadget_module_context_t *module, char out[RADIO_TITLE_BYTES]);
 void radio_directory_request(gadget_module_context_t *module, const char *query, radio_directory_mode_t mode,
-                             unsigned offset);
+                             radio_directory_cursor_t cursor);
 void radio_directory_page(gadget_module_context_t *module, radio_directory_page_t *page);
 unsigned radio_find_directory_hosts(gadget_module_context_t *module,
                                     char hosts[DIRECTORY_MIRRORS][DIRECTORY_HOST_BYTES]);

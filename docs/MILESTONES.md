@@ -71,3 +71,5 @@ Gadget 0.5.1, SD revision 9, ships the updated player with ICY titles, Radio Bro
 ## Gadget 0.6.0
 
 SD revision 10 adds the Space startup prompt, screen and keyboard backlight control, battery status and function-key action labels. The user confirmed the release passed their Tanmatsu checks. [Validation record](DEVELOPMENT.md#gadget-060-validation)
+
+SD revision 14 adds colored shortcut symbols, an updated workspace guide, Wi-Fi and resource details in System, and direct AAC playback and stream details in Radio. The user confirmed this revision passed their Tanmatsu checks. [Revision 14 validation](DEVELOPMENT.md#gadget-060-sd-revision-14-validation)

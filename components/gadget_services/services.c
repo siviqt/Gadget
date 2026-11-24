@@ -10,6 +10,7 @@
 #include "bsp/power.h"
 #include "bsp/rtc.h"
 #include "esp_crt_bundle.h"
+#include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -38,6 +39,14 @@ static uint8_t messages[MESSAGE_COUNT * sizeof(gadget_message_t)];
 static StaticSemaphore_t net_lock_storage;
 static SemaphoreHandle_t net_lock;
 static bool clock_valid, wifi_started, radio_used;
+static bool wifi_events_registered;
+static portMUX_TYPE network_details_lock = portMUX_INITIALIZER_UNLOCKED;
+static gadget_network_details_t network_details;
+static unsigned network_generation;
+static TaskHandle_t network_sampler;
+static StaticSemaphore_t network_sampler_done_storage;
+static SemaphoreHandle_t network_sampler_done;
+static atomic_bool network_sample_pending, network_sampler_stopping;
 static char zone_name[64] = "UTC";
 static unsigned next_wifi_slot;
 static uint64_t next_wifi_attempt;
@@ -65,15 +74,25 @@ esp_err_t gadget_services_init(void)
 {
     inbox = xQueueCreateStatic(MESSAGE_COUNT, sizeof(gadget_message_t), messages, &inbox_storage);
     net_lock = xSemaphoreCreateMutexStatic(&net_lock_storage);
+    network_sampler_done = xSemaphoreCreateBinaryStatic(&network_sampler_done_storage);
     gadget_audio_init();
     clock_valid = bsp_rtc_update_time() == ESP_OK;
     load_timezone();
-    return inbox && net_lock ? ESP_OK : ESP_ERR_NO_MEM;
+    return inbox && net_lock && network_sampler_done ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 void gadget_services_shutdown(void)
 {
     gadget_motion_shutdown();
+    if (network_sampler != NULL) {
+        atomic_store(&network_sampler_stopping, true);
+        xTaskNotifyGive(network_sampler);
+        if (xSemaphoreTake(network_sampler_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Wi-Fi diagnostics still stopping");
+            return;
+        }
+        network_sampler = NULL;
+    }
     if (wifi_started) {
         wifi_connection_disconnect();
         esp_wifi_stop();
@@ -177,6 +196,134 @@ gadget_wifi_status_t gadget_services_wifi_status(void)
     return status;
 }
 
+static void wifi_details_event(void *arg, esp_event_base_t base, int32_t event, void *data)
+{
+    (void)arg;
+    (void)base;
+    if (event != WIFI_EVENT_STA_CONNECTED && event != WIFI_EVENT_STA_DISCONNECTED &&
+        event != WIFI_EVENT_STA_STOP) {
+        return;
+    }
+    taskENTER_CRITICAL(&network_details_lock);
+    ++network_generation;
+    network_details.associated = event == WIFI_EVENT_STA_CONNECTED;
+    network_details.ssid[0] = '\0';
+    network_details.ipv4[0] = '\0';
+    network_details.ipv6_count = 0;
+    network_details.signal_valid = false;
+    if (network_details.associated && data != NULL) {
+        const wifi_event_sta_connected_t *connected = data;
+        const size_t length = connected->ssid_len < sizeof(network_details.ssid) - 1 ?
+                              connected->ssid_len : sizeof(network_details.ssid) - 1;
+        memcpy(network_details.ssid, connected->ssid, length);
+        network_details.ssid[length] = '\0';
+    }
+    taskEXIT_CRITICAL(&network_details_lock);
+}
+
+void gadget_services_network_details(gadget_network_details_t *result)
+{
+    taskENTER_CRITICAL(&network_details_lock);
+    *result = network_details;
+    taskEXIT_CRITICAL(&network_details_lock);
+}
+
+static void sample_network_details(void)
+{
+    if (xSemaphoreTake(net_lock, 0) != pdTRUE) {
+        return;
+    }
+    gadget_network_details_t sample;
+    taskENTER_CRITICAL(&network_details_lock);
+    unsigned generation = network_generation;
+    sample = network_details;
+    taskEXIT_CRITICAL(&network_details_lock);
+
+    esp_netif_t *netif = wifi_started ? wifi_get_netif() : NULL;
+    if (netif != NULL) {
+        sample.mac_valid = esp_netif_get_mac(netif, sample.mac) == ESP_OK;
+        sample.signal_valid = false;
+        sample.ipv4[0] = '\0';
+        sample.ipv6_count = 0;
+        const bool up = esp_netif_is_netif_up(netif);
+        if (sample.associated || (!wifi_events_registered && up)) {
+            wifi_ap_record_t ap;
+            const esp_err_t result = esp_wifi_sta_get_ap_info(&ap);
+            if (result == ESP_OK) {
+                memcpy(sample.ssid, ap.ssid, sizeof(sample.ssid) - 1);
+                sample.ssid[sizeof(sample.ssid) - 1] = '\0';
+                sample.rssi_dbm = ap.rssi;
+                sample.associated = sample.signal_valid = true;
+            } else if (result == ESP_ERR_WIFI_NOT_CONNECT) {
+                sample.associated = false;
+                sample.ssid[0] = '\0';
+            }
+        }
+        if (sample.associated && up) {
+            esp_netif_ip_info_t address;
+            if (esp_netif_get_ip_info(netif, &address) == ESP_OK && address.ip.addr != 0) {
+                esp_ip4addr_ntoa(&address.ip, sample.ipv4, sizeof(sample.ipv4));
+            }
+#if CONFIG_LWIP_IPV6
+            esp_ip6_addr_t addresses[CONFIG_LWIP_IPV6_NUM_ADDRESSES];
+            const int count = esp_netif_get_all_ip6(netif, addresses);
+            for (int i = 0; i < count && sample.ipv6_count < GADGET_NETWORK_IPV6_LIMIT; ++i) {
+                gadget_ipv6_address_t *ipv6 = &sample.ipv6[sample.ipv6_count];
+                if (inet_ntop(AF_INET6, addresses[i].addr, ipv6->address, sizeof(ipv6->address)) != NULL) {
+                    ipv6->link_local = esp_netif_ip6_get_addr_type(&addresses[i]) == ESP_IP6_ADDR_IS_LINK_LOCAL;
+                    ++sample.ipv6_count;
+                }
+            }
+#endif
+        }
+    }
+    taskENTER_CRITICAL(&network_details_lock);
+    if (generation == network_generation) {
+        network_details = sample;
+    }
+    taskEXIT_CRITICAL(&network_details_lock);
+    xSemaphoreGive(net_lock);
+}
+
+static void run_network_sampler(void *arg)
+{
+    (void)arg;
+    const gadget_event_t event = {.topic = GADGET_EVENT_SYSTEM_SAMPLE};
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (atomic_load(&network_sampler_stopping)) {
+            break;
+        }
+        sample_network_details();
+        atomic_store(&network_sample_pending, false);
+        gadget_services_publish(&event);
+    }
+    xSemaphoreGive(network_sampler_done);
+    vTaskDelete(NULL);
+}
+
+bool gadget_services_request_network_sample(void)
+{
+    if (atomic_load(&network_sample_pending)) {
+        return true;
+    }
+    if (xSemaphoreTake(net_lock, 0) != pdTRUE) {
+        return false;
+    }
+    const bool started = wifi_started;
+    xSemaphoreGive(net_lock);
+    if (!started) {
+        return false;
+    }
+    if (network_sampler == NULL &&
+        xTaskCreate(run_network_sampler, "gadget_netstat", 4096, NULL, 2, &network_sampler) != pdPASS) {
+        return false;
+    }
+    atomic_store(&network_sample_pending, true);
+    xTaskNotifyGive(network_sampler);
+    return true;
+}
+
 static bool connect_wifi(const atomic_bool *stopping)
 {
     if (wifi_connected()) {
@@ -194,6 +341,8 @@ static bool connect_wifi(const atomic_bool *stopping)
             return false;
         }
         wifi_started = true;
+        wifi_events_registered = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                            wifi_details_event, NULL) == ESP_OK;
     }
     const uint64_t deadline = gadget_services_uptime_ms() + WIFI_ATTEMPT_MS;
     for (unsigned tried = 0; tried < WIFI_SETTINGS_MAX && !atomic_load(stopping) &&

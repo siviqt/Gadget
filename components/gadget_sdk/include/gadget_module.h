@@ -15,6 +15,20 @@
 typedef struct gadget_module_context gadget_module_context_t;
 typedef struct gadget_http_stream gadget_http_stream_t;
 typedef struct gadget_json gadget_json_t;
+typedef struct gadget_aac_decoder gadget_aac_decoder_t;
+
+typedef struct {
+    uint32_t sample_rate;
+    unsigned channels;
+} gadget_pcm_format_t;
+
+typedef struct {
+    gadget_aac_decoder_t *(*open)(void);
+    // Decode one complete ADTS frame. Return PCM frames, or -1 for an invalid frame.
+    int (*decode)(gadget_aac_decoder_t *, uint8_t *frame, size_t length, int16_t *pcm, size_t capacity_samples,
+                  gadget_pcm_format_t *);
+    void (*close)(gadget_aac_decoder_t *);
+} gadget_aac_api_t;
 
 typedef enum {
     GADGET_KEY_ENTER = 1,
@@ -57,6 +71,7 @@ enum {
     GADGET_EVENT_WEATHER_REFRESH = 1,
     GADGET_EVENT_VOLUME_STEP,
     GADGET_EVENT_AUDIO_JACK,
+    GADGET_EVENT_SYSTEM_SAMPLE,
 };
 
 typedef struct {
@@ -136,6 +151,28 @@ typedef struct {
     uint8_t wifi, pcm;
     uint8_t modules, services;
 } gadget_system_status_t;
+
+#define GADGET_NETWORK_IPV6_LIMIT 3
+
+typedef struct {
+    char address[46];
+    bool link_local;
+} gadget_ipv6_address_t;
+
+typedef struct {
+    char ssid[33];
+    char ipv4[16];
+    gadget_ipv6_address_t ipv6[GADGET_NETWORK_IPV6_LIMIT];
+    uint8_t mac[6];
+    uint8_t ipv6_count;
+    int8_t rssi_dbm;
+    bool associated, mac_valid, signal_valid;
+} gadget_network_details_t;
+
+typedef struct {
+    uint32_t internal_total_bytes, psram_total_bytes;
+    gadget_network_details_t network;
+} gadget_system_details_t;
 
 typedef struct {
     uint8_t percent;
@@ -230,6 +267,10 @@ typedef struct {
     gadget_http_stream_t *(*http_open_icy)(gadget_module_context_t *, const char *url, int *status, uint32_t *interval);
     // Runtime task only. Returns false until a valid battery sample is available.
     bool (*battery_status)(gadget_module_context_t *, gadget_battery_status_t *);
+    // Runtime task only. Focused readers receive GADGET_EVENT_SYSTEM_SAMPLE on each refresh.
+    bool (*system_details)(gadget_module_context_t *, gadget_system_details_t *);
+    // A decode worker owns each AAC decoder from open to close.
+    const gadget_aac_api_t *aac;
 } gadget_host_t;
 
 #define GADGET_HOST_HAS(host, member) \

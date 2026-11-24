@@ -5,9 +5,9 @@
 #include <string.h>
 
 static radio_station_t presets[] = {
-    {.name = "Groove Salad", .url = "https://ice5.somafm.com/groovesalad-128-mp3"},
-    {.name = "Drone Zone", .url = "https://ice5.somafm.com/dronezone-128-mp3"},
-    {.name = "Indie Pop Rocks!", .url = "https://ice5.somafm.com/indiepop-128-mp3"},
+    {.name = "Groove Salad", .url = "https://ice5.somafm.com/groovesalad-128-mp3", .codec = RADIO_CODEC_MP3},
+    {.name = "Drone Zone", .url = "https://ice5.somafm.com/dronezone-128-mp3", .codec = RADIO_CODEC_MP3},
+    {.name = "Indie Pop Rocks!", .url = "https://ice5.somafm.com/indiepop-128-mp3", .codec = RADIO_CODEC_MP3},
     {.name = "", .url = ""},
 };
 static unsigned preset_total = sizeof(presets) / sizeof(presets[0]) - 1;
@@ -19,7 +19,10 @@ typedef enum { NO_PAGE, LOAD_QUERY, LOAD_PREVIOUS, LOAD_NEXT, PREFETCH_NEXT } pa
 typedef enum { NO_WRITE, SAVE_STATION, ADD_STATION, REMOVE_STATION } catalog_write_t;
 
 static radio_view_t view;
-static radio_station_t station, remove_target;
+static radio_view_t options_return_view, add_return_view, details_return_view;
+static radio_option_t option;
+static bool vivid, draft_vivid;
+static radio_station_t station, remove_target, detail_station;
 static radio_station_form_t add_form;
 static unsigned selection, volume[2];
 static bool requested, muted, recent_unlisted, remove_preset;
@@ -29,9 +32,18 @@ static const char *notice;
 static char query[RADIO_QUERY_BYTES];
 static size_t query_length;
 static radio_directory_mode_t search_mode;
-static unsigned result_row;
+static unsigned result_row, page_depth;
 static radio_directory_page_t results, next_page, response;
-static page_request_t page_request;
+// Each window contributes at most as many visible pages as raw four-row batches.
+static radio_directory_cursor_t page_history[RADIO_DIRECTORY_LAST_OFFSET / RADIO_PAGE_ROWS + 1];
+static page_request_t page_request, failed_request;
+static radio_directory_cursor_t failed_cursor;
+static directory_status_t page_failure;
+
+static char scrolling_station[RADIO_NAME_BYTES], scrolling_track[RADIO_TITLE_BYTES];
+static uint64_t scroll_started_ms;
+static unsigned scroll_step;
+static gadget_damage_t scroll_damage;
 
 #define UNLISTED UINT32_MAX
 
@@ -92,6 +104,7 @@ static bool init(gadget_module_context_t *module)
     if (!GADGET_HOST_HAS(module->host, audio_headphones)) {
         return false;
     }
+    vivid = module->host->state_int(module, "vivid_theme", 0) == 1;
     const int configured = module->host->setting_int(module, "volume_percent", 60);
     const int speaker = configured >= 0 && configured <= 100 ? configured : 60;
     for (unsigned i = 0; i < 2; ++i) {
@@ -151,7 +164,7 @@ static void remember_station(gadget_module_context_t *module, const radio_statio
 
 static void play(gadget_module_context_t *module, const radio_station_t *candidate, bool toggle_mute)
 {
-    if (candidate == NULL) {
+    if (candidate == NULL || candidate->hls) {
         return;
     }
     if (requested && radio_same_url(&station, candidate)) {
@@ -222,7 +235,7 @@ static void finish_removal(gadget_module_context_t *module)
 
 static void catalog_action(gadget_module_context_t *module, const radio_station_t *candidate, catalog_write_t action)
 {
-    if (pending_write != NO_WRITE || candidate == NULL) {
+    if (pending_write != NO_WRITE || candidate == NULL || candidate->hls) {
         return;
     }
     const bool remove = action == REMOVE_STATION;
@@ -281,21 +294,26 @@ static bool check_catalog(gadget_module_context_t *module)
     return true;
 }
 
-static void request_page(gadget_module_context_t *module, unsigned offset, page_request_t request)
+static void request_page(gadget_module_context_t *module, radio_directory_cursor_t cursor, page_request_t request)
 {
+    failed_request = NO_PAGE;
+    page_failure = DIRECTORY_IDLE;
     page_request = request;
-    radio_directory_request(module, query, search_mode, offset);
+    radio_directory_request(module, query, search_mode, cursor);
 }
 
 static void clear_results(gadget_module_context_t *module)
 {
     if (page_request != NO_PAGE) {
-        radio_directory_request(module, NULL, search_mode, 0);
+        radio_directory_request(module, NULL, search_mode, (radio_directory_cursor_t){0});
     }
     page_request = NO_PAGE;
+    failed_request = NO_PAGE;
+    page_failure = DIRECTORY_IDLE;
     results.status = DIRECTORY_IDLE;
     next_page.status = DIRECTORY_IDLE;
     result_row = 0;
+    page_depth = 0;
 }
 
 static void start_search(gadget_module_context_t *module)
@@ -315,18 +333,32 @@ static void start_search(gadget_module_context_t *module)
     query_length -= first;
     memmove(query, query + first, query_length);
     query[query_length] = '\0';
-    const unsigned offset = results.status == DIRECTORY_ERROR || results.status == DIRECTORY_OFFLINE ? results.offset : 0;
     results.status = DIRECTORY_IDLE;
     next_page.status = DIRECTORY_IDLE;
-    request_page(module, offset, LOAD_QUERY);
+    page_depth = 0;
+    request_page(module, (radio_directory_cursor_t){0}, LOAD_QUERY);
 }
 
 static void maybe_prefetch(gadget_module_context_t *module)
 {
-    if (page_request == NO_PAGE && results.status == DIRECTORY_RESULTS && results.more && results.count > 0 &&
+    if (page_request == NO_PAGE && failed_request == NO_PAGE && results.status == DIRECTORY_RESULTS &&
+        results.more && results.count > 0 &&
         result_row + 2 >= results.count && next_page.status == DIRECTORY_IDLE) {
-        request_page(module, results.offset + RADIO_PAGE_ROWS, PREFETCH_NEXT);
+        request_page(module, results.next, PREFETCH_NEXT);
     }
+}
+
+static void show_page(gadget_module_context_t *module, const radio_directory_page_t *page, page_request_t action)
+{
+    if (action == LOAD_NEXT) {
+        page_history[page_depth++] = results.cursor;
+    } else if (action == LOAD_PREVIOUS) {
+        --page_depth;
+    }
+    results = *page;
+    result_row = action == LOAD_PREVIOUS && results.count != 0 ? results.count - 1 : 0;
+    next_page.status = DIRECTORY_IDLE;
+    maybe_prefetch(module);
 }
 
 static bool check_directory(gadget_module_context_t *module)
@@ -340,6 +372,16 @@ static bool check_directory(gadget_module_context_t *module)
     }
     const page_request_t completed = page_request;
     page_request = NO_PAGE;
+    if (response.status == DIRECTORY_ERROR || response.status == DIRECTORY_OFFLINE) {
+        failed_request = completed == PREFETCH_NEXT ? LOAD_NEXT : completed;
+        failed_cursor = response.cursor;
+        page_failure = response.status;
+        next_page.status = DIRECTORY_IDLE;
+        if (completed == LOAD_QUERY) {
+            results = response;
+        }
+        return view == RADIO_SEARCH_VIEW;
+    }
     const bool end = response.status == DIRECTORY_RESULTS && response.count == 0 && !response.more;
     if ((completed == LOAD_NEXT || completed == PREFETCH_NEXT) && end) {
         results.more = false;
@@ -347,10 +389,7 @@ static bool check_directory(gadget_module_context_t *module)
         next_page = response;
         return false;
     } else {
-        results = response;
-        result_row = completed == LOAD_PREVIOUS && results.count != 0 ? results.count - 1 : 0;
-        next_page.status = DIRECTORY_IDLE;
-        maybe_prefetch(module);
+        show_page(module, &response, completed);
     }
     return true;
 }
@@ -363,26 +402,32 @@ static void next_results(gadget_module_context_t *module)
     if (page_request == PREFETCH_NEXT) {
         page_request = LOAD_NEXT;
     } else if (page_request == NO_PAGE && next_page.status == DIRECTORY_RESULTS) {
-        results = next_page;
-        result_row = 0;
-        next_page.status = DIRECTORY_IDLE;
-        maybe_prefetch(module);
+        show_page(module, &next_page, LOAD_NEXT);
     } else if (page_request == NO_PAGE) {
-        request_page(module, results.offset + RADIO_PAGE_ROWS, LOAD_NEXT);
+        request_page(module, results.next, LOAD_NEXT);
     }
 }
 
 static void previous_results(gadget_module_context_t *module)
 {
-    if (results.status == DIRECTORY_RESULTS && results.offset >= RADIO_PAGE_ROWS &&
+    if (results.status == DIRECTORY_RESULTS && page_depth != 0 &&
         (page_request == NO_PAGE || page_request == PREFETCH_NEXT)) {
-        request_page(module, results.offset - RADIO_PAGE_ROWS, LOAD_PREVIOUS);
+        request_page(module, page_history[page_depth - 1], LOAD_PREVIOUS);
     }
 }
 
 static const radio_station_t *search_selection(void)
 {
     return results.status == DIRECTORY_RESULTS && result_row < results.count ? &results.rows[result_row] : NULL;
+}
+
+static void open_details(const radio_station_t *candidate)
+{
+    if (candidate != NULL) {
+        detail_station = *candidate;
+        details_return_view = view;
+        view = RADIO_DETAILS_VIEW;
+    }
 }
 
 static size_t previous_character(const char *value, size_t position)
@@ -446,18 +491,21 @@ static void search_input(gadget_module_context_t *module, const gadget_key_t *ke
         break;
     case GADGET_KEY_ENTER:
         if (page_request == NO_PAGE || page_request == PREFETCH_NEXT) {
-            start_search(module);
+            if (failed_request != NO_PAGE) {
+                request_page(module, failed_cursor, failed_request);
+            } else {
+                start_search(module);
+            }
         }
         break;
     case GADGET_KEY_F4:
-        if (candidate != NULL) {
-            play(module, candidate, true);
-        }
+        play(module, candidate, true);
         break;
     case GADGET_KEY_F5:
-        if (candidate != NULL) {
-            catalog_action(module, candidate, SAVE_STATION);
-        }
+        catalog_action(module, candidate, SAVE_STATION);
+        break;
+    case GADGET_KEY_F6:
+        open_details(candidate);
         break;
     default:
         break;
@@ -470,10 +518,11 @@ static bool letter(const gadget_key_t *key, char lower)
            (key->text[0] == lower || key->text[0] == lower - 'a' + 'A');
 }
 
-static void begin_add(void)
+static void begin_add(radio_view_t return_view)
 {
     if (pending_write == NO_WRITE) {
         add_form = (radio_station_form_t){0};
+        add_return_view = return_view;
         view = RADIO_ADD_VIEW;
     }
 }
@@ -503,7 +552,7 @@ static void save_entry(gadget_module_context_t *module)
         notice = candidate->name[0] == '\0' ? "Enter a station name." : "Use a name without a leading # or :::.";
     } else if (!radio_station_url_valid(candidate->url)) {
         add_form.url_focused = true;
-        notice = "Use a direct http:// or https:// MP3 URL.";
+        notice = "Enter a direct stream URL starting with http:// or https://.";
     } else {
         catalog_action(module, candidate, ADD_STATION);
     }
@@ -568,9 +617,6 @@ static void player_input(gadget_module_context_t *module, const gadget_key_t *ke
 {
     const unsigned count = station_count();
     switch (key->kind) {
-    case GADGET_KEY_F1:
-        begin_add();
-        break;
     case GADGET_KEY_UP:
     case GADGET_KEY_LEFT:
         if (count != 0) {
@@ -586,6 +632,9 @@ static void player_input(gadget_module_context_t *module, const gadget_key_t *ke
     case GADGET_KEY_ENTER:
     case GADGET_KEY_F4:
         play(module, radio_catalog_station(selection), key->kind == GADGET_KEY_F4);
+        break;
+    case GADGET_KEY_TAB:
+        open_details(requested ? &station : radio_catalog_station(selection));
         break;
     case GADGET_KEY_F5: {
         const unsigned listed = catalog_count();
@@ -614,7 +663,7 @@ static void player_input(gadget_module_context_t *module, const gadget_key_t *ke
             if (selection == catalog_count() && selection < count) {
                 catalog_action(module, radio_catalog_station(selection), SAVE_STATION);
             } else {
-                begin_add();
+                begin_add(RADIO_PLAYER_VIEW);
             }
         }
         break;
@@ -625,12 +674,77 @@ static void player_input(gadget_module_context_t *module, const gadget_key_t *ke
 
 static void update(gadget_module_context_t *module, uint64_t now)
 {
-    (void)now;
     const bool catalog_changed = check_catalog(module);
     const bool directory_changed = check_directory(module);
     if (catalog_changed || directory_changed) {
         module->host->invalidate(module);
     }
+    if (view == RADIO_PLAYER_VIEW && scroll_damage.width != 0 && now > scroll_started_ms + 1250) {
+        const uint32_t elapsed = (uint32_t)(now - scroll_started_ms - 1250);
+        const unsigned next = elapsed / 250 + 1;
+        if (next != scroll_step) {
+            scroll_step = next;
+            if (GADGET_HOST_HAS(module->host, invalidate_region)) {
+                module->host->invalidate_region(module, scroll_damage);
+            } else {
+                module->host->invalidate(module);
+            }
+        }
+    }
+}
+
+static void options_input(gadget_module_context_t *module, const gadget_key_t *key)
+{
+    if (view == RADIO_OPTIONS_VIEW) {
+        if (key->kind == GADGET_KEY_UP || key->kind == GADGET_KEY_DOWN) {
+            option = (option + (key->kind == GADGET_KEY_DOWN ? 1 : RADIO_OPTION_COUNT - 1)) % RADIO_OPTION_COUNT;
+        } else if (key->kind == GADGET_KEY_ENTER || key->kind == GADGET_KEY_F4) {
+            switch (option) {
+            case RADIO_OPTION_ADD: begin_add(RADIO_OPTIONS_VIEW); break;
+            case RADIO_OPTION_APPEARANCE:
+                draft_vivid = vivid;
+                view = RADIO_APPEARANCE_VIEW;
+                break;
+            case RADIO_OPTION_ABOUT: view = RADIO_ABOUT_VIEW; break;
+            default: break;
+            }
+        }
+    } else if (view == RADIO_APPEARANCE_VIEW) {
+        if (key->kind == GADGET_KEY_LEFT || key->kind == GADGET_KEY_RIGHT) {
+            draft_vivid = !draft_vivid;
+        } else if (key->kind == GADGET_KEY_F4 || key->kind == GADGET_KEY_ENTER) {
+            if (module->host->state_set_int(module, "vivid_theme", draft_vivid)) {
+                vivid = draft_vivid;
+                view = RADIO_OPTIONS_VIEW;
+            } else {
+                notice = "Could not queue theme settings.";
+            }
+        }
+    }
+}
+
+static void back(gadget_module_context_t *module)
+{
+    switch (view) {
+    case RADIO_PLAYER_VIEW:
+        view = RADIO_SEARCH_VIEW;
+        maybe_prefetch(module);
+        break;
+    case RADIO_SEARCH_VIEW:
+        if (page_request != NO_PAGE) {
+            radio_directory_request(module, NULL, search_mode, (radio_directory_cursor_t){0});
+            page_request = NO_PAGE;
+        }
+        view = RADIO_PLAYER_VIEW;
+        break;
+    case RADIO_ADD_VIEW: view = add_return_view; break;
+    case RADIO_REMOVE_VIEW: view = RADIO_PLAYER_VIEW; break;
+    case RADIO_OPTIONS_VIEW: view = options_return_view; break;
+    case RADIO_APPEARANCE_VIEW:
+    case RADIO_ABOUT_VIEW: view = RADIO_OPTIONS_VIEW; break;
+    case RADIO_DETAILS_VIEW: view = details_return_view; break;
+    }
+    notice = NULL;
 }
 
 static void input(gadget_module_context_t *module, const gadget_key_t *key)
@@ -649,16 +763,12 @@ static void input(gadget_module_context_t *module, const gadget_key_t *key)
     }
     if (key->kind == GADGET_KEY_F3) {
         stop(module);
+    } else if (key->kind == GADGET_KEY_F1 && (view == RADIO_PLAYER_VIEW || view == RADIO_SEARCH_VIEW)) {
+        options_return_view = view;
+        option = RADIO_OPTION_ADD;
+        view = RADIO_OPTIONS_VIEW;
     } else if (key->kind == GADGET_KEY_F2 && (!editing || pending_write == NO_WRITE)) {
-        if (view == RADIO_SEARCH_VIEW && page_request != NO_PAGE) {
-            radio_directory_request(module, NULL, search_mode, 0);
-            page_request = NO_PAGE;
-        }
-        view = view == RADIO_PLAYER_VIEW ? RADIO_SEARCH_VIEW : RADIO_PLAYER_VIEW;
-        notice = NULL;
-        if (view == RADIO_SEARCH_VIEW) {
-            maybe_prefetch(module);
-        }
+        back(module);
     } else if (view == RADIO_ADD_VIEW) {
         add_input(module, key);
     } else if (view == RADIO_REMOVE_VIEW) {
@@ -667,8 +777,10 @@ static void input(gadget_module_context_t *module, const gadget_key_t *key)
         }
     } else if (view == RADIO_SEARCH_VIEW) {
         search_input(module, key);
-    } else {
+    } else if (view == RADIO_PLAYER_VIEW) {
         player_input(module, key);
+    } else {
+        options_input(module, key);
     }
     module->host->invalidate(module);
 }
@@ -700,8 +812,17 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
     const unsigned count = station_count();
     char track[RADIO_TITLE_BYTES];
     radio_stream_title(module, track);
+    const size_t name_bytes = radio_text_length(station.name, sizeof(scrolling_station) - 1) + 1;
+    const size_t track_bytes = radio_text_length(track, sizeof(scrolling_track) - 1) + 1;
+    if (memcmp(scrolling_station, station.name, name_bytes) != 0 || memcmp(scrolling_track, track, track_bytes) != 0) {
+        memcpy(scrolling_station, station.name, name_bytes);
+        memcpy(scrolling_track, track, track_bytes);
+        scroll_started_ms = module->host->uptime_ms();
+        scroll_step = 0;
+    }
     const radio_screen_t screen = {
-        .view = view, .playback = radio_playback(), .station = &station, .remove_target = &remove_target,
+        .view = view, .playback = radio_playback(), .stream = radio_stream_info(module),
+        .station = &station, .remove_target = &remove_target, .detail_station = &detail_station,
         .form = &add_form,
         .results = &results, .query = query, .notice = notice, .track = track, .search_mode = search_mode,
         .selection = selection, .station_count = count, .preset_count = preset_count,
@@ -709,8 +830,10 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
         .requested = requested, .muted = muted, .saving = pending_write != NO_WRITE, .preview = count > catalog_count(),
         .removable = selection < catalog_count() && pending_write == NO_WRITE,
         .loading = page_request != NO_PAGE && page_request != PREFETCH_NEXT,
+        .page_failure = page_failure, .option = option, .vivid = vivid, .draft_vivid = draft_vivid,
+        .scroll_step = scroll_step, .aac_available = GADGET_HOST_HAS(module->host, aac), .has_previous = page_depth != 0,
     };
-    radio_render(module, canvas, &screen);
+    scroll_damage = radio_render(module, canvas, &screen);
 }
 
 static const gadget_module_t hooks = {

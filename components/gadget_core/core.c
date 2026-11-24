@@ -83,7 +83,7 @@ static TickType_t wait_for_update(const gadget_dice_t *dice)
     return wait_until(next < next_metrics_ms ? next : next_metrics_ms);
 }
 
-static void sample_metrics(void)
+static void sample_metrics(bool workspace_visible)
 {
     const uint64_t now = gadget_services_uptime_ms();
     if (now >= next_metrics_ms) {
@@ -93,6 +93,9 @@ static void sample_metrics(void)
         gadget_services_measure_stack("gadget_sd_save", gadget_config_stack_free());
         gadget_modules_measure_stacks();
         gadget_services_log_metrics();
+        if (workspace_visible) {
+            gadget_modules_system_sample();
+        }
     }
 }
 
@@ -209,7 +212,7 @@ static esp_err_t edit_layout(unsigned *face, bool *selected)
         }
         ESP_RETURN_ON_ERROR(gadget_graphics_layout(&view), TAG, "Unable to present layout editor");
         for (;;) {
-            sample_metrics();
+            sample_metrics(false);
             gadget_message_t message;
             if (!gadget_services_receive(&message, wait_until(next_metrics_ms))) {
                 continue;
@@ -268,7 +271,7 @@ static esp_err_t wait_in_guide(bool startup, unsigned *face)
     ESP_RETURN_ON_ERROR(gadget_graphics_guide(mode), TAG, "Unable to present workspace guide");
     int64_t shown_at_us = esp_timer_get_time();
     for (;;) {
-        sample_metrics();
+        sample_metrics(false);
         gadget_message_t message;
         if (!gadget_services_receive(&message, wait_until(next_metrics_ms))) {
             continue;
@@ -355,7 +358,7 @@ static esp_err_t run_workspaces(void)
         }
 
         if (gadget_graphics_blanked()) {
-            sample_metrics();
+            sample_metrics(false);
             continue;
         }
         const int64_t now = esp_timer_get_time();
@@ -368,6 +371,7 @@ static esp_err_t run_workspaces(void)
             ESP_RETURN_ON_ERROR(gadget_graphics_transition(dice.frame), TAG, "Unable to present reel");
             continue;
         }
+        sample_metrics(!help_requested);
         gadget_modules_tick(dice.active, gadget_services_uptime_ms());
         gadget_damage_t damage = {0};
         const bool invalidated = gadget_modules_take_redraw(dice.active, &damage);
@@ -383,7 +387,6 @@ static esp_err_t run_workspaces(void)
             ESP_LOGI(TAG, "Last selection took %" PRIu32 " us through presentation", elapsed_us);
             gadget_graphics_log_transition();
         }
-        sample_metrics();
         if (help_requested) {
             help_requested = false;
             unsigned face = dice.active;
@@ -424,7 +427,7 @@ static esp_err_t start_from_sd(void)
             const gadget_workspace_draw_t preview = gadget_modules_startup_preview(face) ? gadget_modules_draw : NULL;
             gadget_graphics_prepare_workspace(face, gadget_layout_key(&layout, face) + 1, title, preview);
         }
-        sample_metrics();
+        sample_metrics(false);
         result = run_workspaces();
         const bool modules_stopped = gadget_modules_shutdown();
         const bool settings_saved = gadget_config_stop();

@@ -360,7 +360,7 @@ static void render_forecast(gadget_module_context_t *module, const gadget_canvas
 
 static void action(const gadget_canvas_t *canvas, int x, int y, gadget_key_kind_t key, const char *label)
 {
-    gadget_draw_function_key(canvas, x, y, key, 0xff253648, accent);
+    gadget_draw_function_key(canvas, x, y, key, 0xff253648, GADGET_KEYCAP_OPAQUE);
     canvas->text(canvas->handle, x + GADGET_KEYCAP_WIDTH + 8, y + 2, 16, muted, label);
 }
 

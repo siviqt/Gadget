@@ -13,6 +13,7 @@
 
 static const char *const TAG = "gadget_metrics";
 static gadget_system_status_t status;
+static uint32_t internal_total_bytes, psram_total_bytes;
 static gadget_battery_status_t battery;
 static uint64_t next_battery_ms;
 static bool battery_valid;
@@ -88,6 +89,8 @@ void gadget_services_measure(void)
     measure_cpu();
     status.internal = measure_heap(MALLOC_CAP_INTERNAL);
     status.psram = measure_heap(MALLOC_CAP_SPIRAM);
+    internal_total_bytes = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    psram_total_bytes = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     status.least_stack_bytes = UINT32_MAX;
     gadget_services_measure_stack("main", uxTaskGetStackHighWaterMark(NULL));
     gadget_audio_measure_stack();
@@ -100,6 +103,13 @@ void gadget_services_system_status(gadget_system_status_t *result)
     *result = status;
     result->wifi = gadget_services_wifi_status();
     result->pcm = gadget_audio_status();
+}
+
+void gadget_services_system_details(gadget_system_details_t *result)
+{
+    result->internal_total_bytes = internal_total_bytes;
+    result->psram_total_bytes = psram_total_bytes;
+    gadget_services_network_details(&result->network);
 }
 
 bool gadget_services_battery_status(gadget_battery_status_t *result)

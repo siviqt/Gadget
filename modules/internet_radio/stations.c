@@ -40,6 +40,51 @@ static char lower_hex(char ch)
     return ch >= 'A' && ch <= 'F' ? ch + ('a' - 'A') : ch;
 }
 
+static const char *const codec_names[] = {
+    [RADIO_CODEC_AUTO] = "",
+    [RADIO_CODEC_MP3] = "MP3",
+    [RADIO_CODEC_AAC] = "AAC",
+    [RADIO_CODEC_AAC_PLUS] = "AAC+",
+    [RADIO_CODEC_HE_AAC_V2] = "HE-AACv2",
+};
+
+const char *radio_codec_name(radio_codec_t codec)
+{
+    return (unsigned)codec < sizeof(codec_names) / sizeof(codec_names[0]) ? codec_names[codec] : "";
+}
+
+static bool same_codec_name(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        const char left = *a >= 'a' && *a <= 'z' ? *a - ('a' - 'A') : *a;
+        const char right = *b >= 'a' && *b <= 'z' ? *b - ('a' - 'A') : *b;
+        if (left != right) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+
+radio_codec_t radio_codec_from_name(const char *name)
+{
+    if (name != NULL) {
+        for (unsigned i = RADIO_CODEC_MP3; i < sizeof(codec_names) / sizeof(codec_names[0]); ++i) {
+            if (same_codec_name(name, codec_names[i])) {
+                return (radio_codec_t)i;
+            }
+        }
+        if (same_codec_name(name, "AAC-LC")) {
+            return RADIO_CODEC_AAC;
+        }
+        if (same_codec_name(name, "HE-AAC")) {
+            return RADIO_CODEC_AAC_PLUS;
+        }
+    }
+    return RADIO_CODEC_AUTO;
+}
+
 bool radio_same_url(const radio_station_t *a, const radio_station_t *b)
 {
     const size_t size = radio_text_length(a->url, RADIO_URL_BYTES);
@@ -140,7 +185,7 @@ static char *trim(char *value)
     return value;
 }
 
-static bool parse_record(char *line, radio_station_t *station, bool *mp3)
+static bool parse_record(char *line, radio_station_t *station, bool *direct)
 {
     char *fields[5] = {0};
     for (unsigned i = 0; i < 4; ++i) {
@@ -197,7 +242,8 @@ static bool parse_record(char *line, radio_station_t *station, bool *mp3)
     station->bitrate = bitrate;
     memcpy(station->name, fields[0], radio_text_length(fields[0], RADIO_NAME_BYTES) + 1);
     memcpy(station->url, fields[1], radio_text_length(fields[1], RADIO_URL_BYTES) + 1);
-    *mp3 = radio_text_length(fields[3], 4) == 3 && memcmp(fields[3], "MP3", 3) == 0;
+    station->codec = radio_codec_from_name(fields[3]);
+    *direct = station->codec != RADIO_CODEC_AUTO || same_codec_name(fields[3], "AUTO");
     return true;
 }
 
@@ -211,7 +257,7 @@ typedef struct {
 typedef struct {
     radio_station_t station;
     size_t start, end, uuid_start, uuid_end;
-    bool mp3;
+    bool direct;
 } catalog_record_t;
 
 static bool next_record(catalog_reader_t *reader, catalog_record_t *record)
@@ -262,7 +308,7 @@ static bool next_record(catalog_reader_t *reader, catalog_record_t *record)
 
         *record = (catalog_record_t){.start = start, .end = reader->position};
         reader->empty = false;
-        if (parse_record(line, &record->station, &record->mp3)) {
+        if (parse_record(line, &record->station, &record->direct)) {
             if (reader->uuid[0] != '\0') {
                 memcpy(record->station.uuid, reader->uuid, sizeof(reader->uuid));
                 record->uuid_start = reader->uuid_start;
@@ -285,7 +331,7 @@ static bool parse_catalog(void)
     bool any = false;
     while (next_record(&reader, &record)) {
         any = true;
-        if (record.mp3 && count < STATION_LIMIT && !duplicate(&record.station)) {
+        if (record.direct && count < STATION_LIMIT && !duplicate(&record.station)) {
             saved[count++] = record.station;
         }
     }
@@ -382,13 +428,17 @@ radio_save_t radio_save_station(gadget_module_context_t *module, const radio_sta
     }
     const bool uuid = radio_uuid_valid(station->uuid);
     const bool comment = uuid || pending_uuid;
+    const char *codec = radio_codec_name(station->codec);
+    if (codec[0] == '\0') {
+        codec = GADGET_HOST_HAS(module->host, aac) ? "AUTO" : "MP3";
+    }
     const size_t available = sizeof(draft) - length;
-    const int written = module->host->format(draft + length, available, "%s%s%s%s%s%s:::%s%s:::%s:::MP3:::%u\n",
+    const int written = module->host->format(draft + length, available, "%s%s%s%s%s%s:::%s%s:::%s:::%s:::%u\n",
                           length && contents[length - 1] != '\n' ? "\n" : "",
                           comment ? UUID_COMMENT : "", uuid ? station->uuid : "", comment ? "\n" : "",
                           station->name, separator_padding(station->name, sizeof(station->name)),
                           station->url, separator_padding(station->url, sizeof(station->url)),
-                          station->country, (unsigned)station->bitrate);
+                          station->country, codec, (unsigned)station->bitrate);
     if (written < 0 || (size_t)written >= available) {
         return RADIO_SAVE_FAILED;
     }
@@ -413,7 +463,7 @@ radio_save_t radio_remove_station(gadget_module_context_t *module, const radio_s
     size_t preserved = 0;
     draft_length = 0;
     while (next_record(&reader, &record)) {
-        if (!record.mp3 || !radio_same_station(station, &record.station)) {
+        if (!record.direct || !radio_same_station(station, &record.station)) {
             continue;
         }
         if (record.uuid_end != 0) {

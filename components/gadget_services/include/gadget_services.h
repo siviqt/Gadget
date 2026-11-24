@@ -32,6 +32,7 @@ bool gadget_services_motion_read(gadget_motion_t *sample);
 
 bool gadget_services_network_connected(void);
 gadget_wifi_status_t gadget_services_wifi_status(void);
+bool gadget_services_request_network_sample(void);
 gadget_http_stream_t *gadget_services_http_open(const char *url, int *status, const atomic_bool *stopping);
 gadget_http_stream_t *gadget_services_http_open_icy(const char *url, int *status, uint32_t *interval,
                                                    const atomic_bool *stopping);
@@ -49,6 +50,7 @@ bool gadget_services_audio_headphones(void);
 bool gadget_services_audio_playing(const void *owner);
 int gadget_services_audio_write(const void *owner, const int16_t *stereo, size_t frames);
 void gadget_services_audio_close(const void *owner);
+extern const gadget_aac_api_t gadget_aac_api;
 
 #define GADGET_METRICS_INTERVAL_MS 5000
 
@@ -57,4 +59,5 @@ void gadget_services_measure_stack(const char *name, unsigned free_bytes);
 void gadget_services_log_metrics(void);
 void gadget_services_record_transition(uint32_t elapsed_us);
 void gadget_services_system_status(gadget_system_status_t *result);
+void gadget_services_system_details(gadget_system_details_t *result);
 bool gadget_services_battery_status(gadget_battery_status_t *result);

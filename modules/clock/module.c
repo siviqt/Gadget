@@ -175,7 +175,7 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
     canvas->text(canvas->handle, margin, top + 113, 20, muted, line);
     render_calendar(module, canvas);
     const int footer = canvas->height - 44;
-    gadget_draw_function_key(canvas, margin, footer, CLOCK_TIME_ZONE_KEY, 0xff263b4a, accent);
+    gadget_draw_function_key(canvas, margin, footer, CLOCK_TIME_ZONE_KEY, 0xff263b4a, GADGET_KEYCAP_OPAQUE);
     canvas->text(canvas->handle, margin + GADGET_KEYCAP_WIDTH + 8, footer + 2, 16, muted, "Local/UTC");
     canvas->text(canvas->handle, margin + 130, footer + 2, 16, muted, "Left/Right  Month     Enter  Today");
 }

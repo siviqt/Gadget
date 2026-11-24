@@ -14,6 +14,7 @@
 #define SYNC_BYTES 8192u
 #define SYNC_TAIL 2048u
 #define MAX_INVALID_BYTES (64u * 1024)
+#define PCM_FRAMES 2048u
 #define STALL_MS 4000u
 #define STATUS_BITS 4u
 #define STATUS_MASK ((1u << STATUS_BITS) - 1)
@@ -32,6 +33,11 @@ typedef struct {
     char text[RADIO_TITLE_BYTES];
 } stream_title_t;
 
+typedef struct {
+    unsigned id, serial;
+    radio_stream_info_t format;
+} stream_info_t;
+
 static tune_request_t request;
 // Publish the tune generation and the status together so an old worker cannot undo Stop.
 static atomic_uint playback;
@@ -45,12 +51,13 @@ static atomic_uint failed_stream, failed_status, playing_stream;
 
 static radio_icy_t icy;
 static stream_title_t wire_title, decoded_title;
+static stream_info_t decoded_info;
 static atomic_uint title_revision;
 
 // Decoder-owned state and scratch. minimp3 keeps its largest scratch array on this worker's stack.
 static mp3dec_t decoder;
 static uint8_t decode_input[DECODE_BYTES];
-static int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+static int16_t pcm[PCM_FRAMES * 2];
 
 void radio_tune(gadget_module_context_t *module, const char *url)
 {
@@ -77,6 +84,22 @@ radio_playback_t radio_playback(void)
 static unsigned requested_serial(void)
 {
     return atomic_load(&playback) >> STATUS_BITS;
+}
+
+radio_stream_info_t radio_stream_info(gadget_module_context_t *module)
+{
+    stream_info_t info;
+    module->host->copy_shared(module, &info, &decoded_info, sizeof(info));
+    return info.id != 0 && info.id == atomic_load(&stream) && info.serial == requested_serial()
+           ? info.format : (radio_stream_info_t){0};
+}
+
+static void publish_info(gadget_module_context_t *module, unsigned id, unsigned serial,
+                         radio_codec_t codec, unsigned bitrate)
+{
+    const stream_info_t info = {.id = id, .serial = serial, .format = {.codec = codec, .bitrate = bitrate}};
+    module->host->copy_shared(module, &decoded_info, &info, sizeof(info));
+    module->host->invalidate(module);
 }
 
 void radio_stream_title(gadget_module_context_t *module, char out[RADIO_TITLE_BYTES])
@@ -191,7 +214,7 @@ static void download(gadget_module_context_t *module, unsigned serial, unsigned 
         }
         if (now >= report_at) {
             char line[80];
-            module->host->format(line, sizeof(line), "MP3 buffer %u bytes, low %u bytes", used, low);
+            module->host->format(line, sizeof(line), "Compressed buffer %u bytes, low %u bytes", used, low);
             module->host->log(module, line);
             report_at = now + 5000;
             low = used;
@@ -333,10 +356,13 @@ static bool queue_pcm(gadget_module_context_t *module, unsigned id, unsigned ser
 static radio_playback_t play_stream(gadget_module_context_t *module, unsigned id, unsigned serial)
 {
     mp3dec_init(&decoder);
+    const gadget_aac_api_t *aac = GADGET_HOST_HAS(module->host, aac) ? module->host->aac : NULL;
+    gadget_aac_decoder_t *aac_decoder = NULL;
     unsigned start = 0, used = 0, skipped = 0;
     unsigned gain = atomic_load(&levels);
     unsigned title_seen = 0;
-    int rate = 0;
+    uint32_t rate = 0;
+    unsigned bits = 0, samples = 0;
     radio_playback_t error = RADIO_STOPPED;
     while (stream_current(module, id, serial)) {
         if (used < DECODE_BYTES / 2) {
@@ -346,18 +372,22 @@ static radio_playback_t play_stream(gadget_module_context_t *module, unsigned id
             }
             used += read_ring(decode_input + used, DECODE_BYTES - used);
         }
-        if (used < 4) {
-            if (rate != 0) {
-                update_output(module, id, serial, &gain);
+        if (rate == 0 && aac_decoder == NULL && aac != NULL) {
+            const unsigned sync = radio_adts_sync(decode_input + start, used);
+            if (sync < used) {
+                aac_decoder = aac->open();
+                if (aac_decoder == NULL) {
+                    error = RADIO_OUTPUT_ERROR;
+                    break;
+                }
+                start += sync;
+                used -= sync;
             }
-            wait_for_command(module, 10);
-            continue;
         }
 
-        // Once synchronized, decode as soon as a complete frame is available.
-        // Batch input only when scanning for a new MP3 header.
-        const unsigned frame_bytes = (unsigned)radio_mp3_frame_bytes(&decoder, decode_input + start);
-        const unsigned needed = frame_bytes == 0 ? SYNC_BYTES : frame_bytes;
+        const unsigned frame_bytes = aac_decoder != NULL ? radio_adts_frame_bytes(decode_input + start, used) :
+                                     used >= 4 ? (unsigned)radio_mp3_frame_bytes(&decoder, decode_input + start) : 0;
+        const unsigned needed = frame_bytes != 0 ? frame_bytes : aac_decoder != NULL ? 7 : SYNC_BYTES;
         if (used < needed) {
             if (rate != 0) {
                 update_output(module, id, serial, &gain);
@@ -366,12 +396,29 @@ static radio_playback_t play_stream(gadget_module_context_t *module, unsigned id
             continue;
         }
 
-        mp3dec_frame_info_t info = {0};
-        const int frames = mp3dec_decode_frame(&decoder, decode_input + start,
-                                                frame_bytes == 0 ? used : frame_bytes, pcm, &info);
-        unsigned consumed = info.frame_bytes > 0 ? (unsigned)info.frame_bytes : 0;
-        if (info.layer == 0 && consumed == used && used > SYNC_TAIL) {
-            consumed -= SYNC_TAIL;
+        gadget_pcm_format_t format = {0};
+        int frames = 0;
+        unsigned encoded_bytes = frame_bytes;
+        unsigned consumed;
+        if (aac_decoder != NULL) {
+            consumed = frame_bytes != 0 ? frame_bytes : 1;
+            if (frame_bytes != 0) {
+                frames = aac->decode(aac_decoder, decode_input + start, frame_bytes, pcm, PCM_FRAMES * 2, &format);
+            }
+        } else {
+            mp3dec_frame_info_t info = {0};
+            frames = mp3dec_decode_frame(&decoder, decode_input + start,
+                                         frame_bytes == 0 ? used : frame_bytes, pcm, &info);
+            consumed = info.frame_bytes > 0 ? (unsigned)info.frame_bytes : 0;
+            encoded_bytes = info.frame_bytes > info.frame_offset ? (unsigned)(info.frame_bytes - info.frame_offset) : 0;
+            if (info.layer == 0 && consumed == used && used > SYNC_TAIL) {
+                consumed -= SYNC_TAIL;
+            }
+            if (frames > 0 && info.layer != 3) {
+                error = RADIO_FORMAT_ERROR;
+                break;
+            }
+            format = (gadget_pcm_format_t){.sample_rate = info.hz, .channels = info.channels};
         }
         if (consumed == 0 || consumed > used) {
             error = RADIO_FORMAT_ERROR;
@@ -379,7 +426,7 @@ static radio_playback_t play_stream(gadget_module_context_t *module, unsigned id
         }
         used -= consumed;
         start += consumed;
-        if (frames == 0) {
+        if (frames <= 0) {
             skipped += consumed;
             if (skipped >= MAX_INVALID_BYTES) {
                 error = RADIO_FORMAT_ERROR;
@@ -388,24 +435,37 @@ static radio_playback_t play_stream(gadget_module_context_t *module, unsigned id
             continue;
         }
         skipped = 0;
-        if (info.layer != 3 || frames > MINIMP3_MAX_SAMPLES_PER_FRAME / 2 ||
-            info.channels < 1 || info.channels > 2 || info.hz < 8000 || info.hz > 48000) {
+        if ((unsigned)frames > PCM_FRAMES || format.channels < 1 || format.channels > 2 ||
+            format.sample_rate < 8000 || format.sample_rate > 48000) {
             error = RADIO_FORMAT_ERROR;
             break;
         }
-        if (info.hz != rate) {
+        const radio_codec_t codec = aac_decoder != NULL ? RADIO_CODEC_AAC : RADIO_CODEC_MP3;
+        if (format.sample_rate != rate) {
             if (rate != 0) {
                 module->host->audio_close(module);
             }
             gain = atomic_load(&levels);
-            if (!module->host->audio_open_buffered(module, (uint32_t)info.hz, gain & 0xffu)) {
+            if (!module->host->audio_open_buffered(module, format.sample_rate, gain & 0xffu)) {
                 error = RADIO_OUTPUT_ERROR;
                 break;
             }
             module->host->audio_levels(module, gain & 0xffu, gain >> 8);
-            rate = info.hz;
+            rate = format.sample_rate;
+            bits = 0;
+            samples = 0;
+            publish_info(module, id, serial, codec, 0);
         }
-        if (!queue_pcm(module, id, serial, frames, info.channels, &gain)) {
+        // Sample a second of audio frames so variable bitrate streams get a stable estimate.
+        if (samples < rate) {
+            bits += encoded_bytes * 8;
+            samples += (unsigned)frames;
+            if (samples >= rate) {
+                const unsigned duration_ms = samples * 1000 / rate;
+                publish_info(module, id, serial, codec, (bits + duration_ms / 2) / duration_ms);
+            }
+        }
+        if (!queue_pcm(module, id, serial, frames, (int)format.channels, &gain)) {
             error = RADIO_OUTPUT_ERROR;
             break;
         }
@@ -413,6 +473,9 @@ static radio_playback_t play_stream(gadget_module_context_t *module, unsigned id
         update_title(module, id, atomic_load_explicit(&tail, memory_order_relaxed) - used, &title_seen);
     }
     module->host->audio_close(module);
+    if (aac_decoder != NULL) {
+        aac->close(aac_decoder);
+    }
     return error;
 }
 

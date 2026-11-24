@@ -75,7 +75,7 @@ static void render(gadget_module_context_t *module, const gadget_canvas_t *canva
     canvas->text(canvas->handle, right, 100, 20, muted, "Background service ticks");
     canvas->text(canvas->handle, margin, 128, 42, accent, decimal(presses, digits));
     canvas->text(canvas->handle, right, 128, 42, accent, decimal(ticks, digits));
-    gadget_draw_function_key(canvas, margin, 183, HELLO_INCREMENT_KEY, 0xff263b4a, accent);
+    gadget_draw_function_key(canvas, margin, 183, HELLO_INCREMENT_KEY, 0xff263b4a, GADGET_KEYCAP_OPAQUE);
     canvas->text(canvas->handle, margin + GADGET_KEYCAP_WIDTH + 8, 185, 16, muted, "Increment");
     if (ticks == 0) {
         canvas->text(canvas->handle, right, 184, 16, muted, "Waiting for Pulse service");

@@ -20,8 +20,12 @@ The project and revision identify the material used to develop each module. Keep
 
 Radio embeds the scalar Layer III decoder from minimp3 revision `142823796ab8efa55e1bf11406028f3be77ecceb`. The source and SD distributions collect the reference licenses and the decoder's CC0 notice in `LICENSE`. [Consolidated license](../LICENSE) · [Pinned minimp3 source](https://github.com/lieff/minimp3/tree/142823796ab8efa55e1bf11406028f3be77ecceb)
 
+Radio 0.5.0 adapts the Midnight and Vivid palettes, search paging and ADTS sync from the pinned TanRadio revision above. The runtime links the AAC decoder from Espressif's `esp_audio_codec` 2.5.0 for the ESP32-P4. The SD package includes the Espressif Modified MIT notice. [Pinned Espressif component](https://components.espressif.com/components/espressif/esp_audio_codec/versions/2.5.0/readme)
+
 Gadget builds five PAX font assets from `modules/ui_fonts/`. The 20 px medium, 24 px semibold and 56 px monospaced semibold assets come from the Chronos revision above. Gadget regenerated the 14 px and 18 px IBM Plex Sans Regular assets from IBM Plex `78cd4223d8de9fcb78cba84eadecb269c56093c5` using the Chronos generator with Pillow 12.3.0 and fontTools 4.61.1. [Active font sources](../components/gadget_graphics/CMakeLists.txt)
 
 To regenerate the two regular assets, work in a Gadget-owned copy of the pinned Chronos `tools/generate_fonts.py` and `assets/fonts/`. Select Sans Regular at 14 and 18 px with `ui` coverage and add the characters in U+0400–U+04FF present in the IBM Plex Sans Regular cmap. The original Chronos coverage and compatibility glyph definitions provide the other characters. Both output files have 919 glyphs. The consolidated license includes the IBM Plex and Chakra Petch compatibility licenses. [Consolidated license](../LICENSE)
 
 The Dice uses Gadget's RGB565 renderer and PAX. SynthEngine3D was evaluated as a reference for the original cube transition. [Inspected SynthEngine3D revision](https://github.com/nullislandspace/synthengine3D/tree/061c26bb37a6d508653bd6df09ff3f04ac65a071)
+
+Gadget's 16-pixel function-key symbols follow the printed Tanmatsu legends depicted in launcher 0.3.1's `fat/tanmatsu/icons/f1.png` through `f6.png`. The SDK draws Gadget's own outlines with colors tuned for its dark backgrounds. [Tanmatsu launcher](https://github.com/Nicolai-Electronics/tanmatsu-launcher)
